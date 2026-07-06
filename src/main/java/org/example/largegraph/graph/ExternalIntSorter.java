@@ -1,5 +1,7 @@
 package org.example.largegraph.graph;
 
+import org.example.largegraph.util.FileUtils;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.Closeable;
@@ -61,10 +63,25 @@ public final class ExternalIntSorter {
                         writer.write(chunk[i]);
                     }
                 }
-                runs.add(run);
+                addRunBounded(runs, run, tempDir);
             }
         }
         return runs;
+    }
+
+    private void addRunBounded(List<Path> runs, Path run, Path tempDir) throws IOException {
+        runs.add(run);
+        if (runs.size() <= MAX_MERGE_FAN_IN) {
+            return;
+        }
+        List<Path> group = new ArrayList<>(runs.subList(0, MAX_MERGE_FAN_IN));
+        Path merged = tempDir.resolve("int-incremental-merged-%05d.bin".formatted(System.nanoTime()));
+        mergeSortedRuns(group, merged);
+        for (Path oldRun : group) {
+            Files.deleteIfExists(oldRun);
+        }
+        runs.subList(0, MAX_MERGE_FAN_IN).clear();
+        runs.add(merged);
     }
 
     private List<Path> compactRuns(List<Path> runs, Path tempDir) throws IOException {
@@ -204,14 +221,7 @@ public final class ExternalIntSorter {
     }
 
     private void deleteRecursively(Path path) throws IOException {
-        if (!Files.exists(path)) {
-            return;
-        }
-        try (var paths = Files.walk(path)) {
-            for (Path child : paths.sorted(Comparator.reverseOrder()).toList()) {
-                Files.deleteIfExists(child);
-            }
-        }
+        FileUtils.deleteRecursively(path);
     }
 
     public record SortUniqueResult(long uniqueCount) {

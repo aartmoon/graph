@@ -55,6 +55,14 @@ final class ArgsParserTest {
         assertThrows(IllegalArgumentException.class, () -> ArgsParser.parse(args));
     }
 
+    @Test
+    void rejectsTooLargeTopK() {
+        String[] args = validArgs();
+        args[19] = Integer.toString(AppConfig.MAX_TOP_K + 1);
+
+        assertThrows(IllegalArgumentException.class, () -> ArgsParser.parse(args));
+    }
+
     private static String[] validArgs() {
         return new String[]{
                 "--input", "data/edges.csv",

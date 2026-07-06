@@ -15,6 +15,8 @@ public record AppConfig(
         int topK,
         boolean keepMessages
 ) {
+    public static final int MAX_TOP_K = 1_000_000;
+
     public AppConfig {
         if (input == null) {
             throw new IllegalArgumentException("--input is required");
@@ -45,6 +47,9 @@ public record AppConfig(
         }
         if (topK < 0) {
             throw new IllegalArgumentException("--top-k must be non-negative");
+        }
+        if (topK > MAX_TOP_K) {
+            throw new IllegalArgumentException("--top-k must be <= " + MAX_TOP_K);
         }
     }
 

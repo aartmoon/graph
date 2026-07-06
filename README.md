@@ -129,8 +129,8 @@ work/
     iter-000001/
       worker-00000/
         manifest.txt
-        msg-part-00000.bin
-        msg-part-00007.bin
+        msg-bucket-00000.bin
+        msg-bucket-00007.bin
 ```
 
 Форматы:
@@ -143,7 +143,7 @@ mapping.bin:                int originalId, int denseId
 endpoint_refs.bin:          int originalId, long edgeId, byte side
 endpoint_assignments.bin:   long edgeId, byte side, int denseId
 src-part-xxxxx.bin:         int denseFrom, int denseTo
-message file:               int denseTo, double contribution
+message bucket file:        int denseTo, double contribution
 rank files:                 double rank[denseId]
 out_degree.bin:             int outDegree[denseId]
 ```
@@ -171,19 +171,21 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 Фаза 1, scatter:
 
 - source partitions сортируются по размеру файла по убыванию;
-- partitions greedily раскладываются в `threads` worker buckets, чтобы тяжелые partitions не закреплялись циклически за одним worker;
+- размеры source partitions берутся из `source-partitions.tsv`, metadata не сканируется через `Files.size` на каждой итерации;
+- большие source partitions режутся на bounded byte-aligned edge slices;
+- slices greedily раскладываются в `threads` worker buckets, чтобы тяжелая partition не закреплялась целиком за одним worker;
 - один worker bucket пишет в одну worker directory;
 - task читает только `rankChunk` и `outDegreeChunk` своего source chunk;
-- messages пишутся в worker directory.
+- messages пишутся в worker directory в bounded destination buckets (`<= 8192` buckets на worker), а не в отдельный файл на каждую destination partition.
 
 Фаза 2, gather:
 
-- каждый worker пишет `manifest.txt` со списком только реально созданных destination partitions;
-- gather строит index из manifest-файлов;
+- каждый worker пишет `manifest.txt` со списком только реально созданных message buckets;
+- gather строит bucket index из manifest-файлов;
 - `rank_next.bin` сначала sequentially заполняется base value для всех partitions;
-- task создается только для destination partitions, реально присутствующих в manifest index;
-- touched destination partitions сортируются по суммарным message bytes по убыванию;
-- task открывает свой `DiskDoubleArray` для `rank_next.bin` и выделяет только `nextChunk` для своего destination chunk;
+- task создается только для touched message buckets;
+- touched buckets сортируются по суммарным message bytes по убыванию;
+- task открывает свой `DiskDoubleArray` для `rank_next.bin` и держит bounded LRU cache destination chunks;
 - `Files.exists` для всех `workers * partitions` не выполняется.
 
 Фаза 3, convergence:
@@ -211,6 +213,8 @@ vertex,rank
 ```text
 rank DESC, originalId ASC
 ```
+
+`K` ограничен сверху значением `1000000`, чтобы случайно не превратить output phase в heap-heavy сортировку.
 
 ## Memory Model
 
@@ -241,7 +245,7 @@ int sort chunk <= 500000 ids
 endpoint record sort chunk <= 250000 records
 ```
 
-Runtime warning остается advisory и отдельно показывает `pagerankChunkEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate` и `maxHeap`; это не полноценный memory planner.
+Runtime warning остается advisory и отдельно показывает `pagerankChunkEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate`, `topKEstimate` и `maxHeap`; это не полноценный memory planner.
 
 В heap не хранятся:
 
@@ -273,7 +277,7 @@ sort runs                  O(E + V)
 edges_by_source            O(E)
 ```
 
-Message IO остается `O(E)` на итерацию. Manifest уменьшает metadata overhead и лишние проверки файлов, но не меняет асимптотику. Message record больше edge record:
+Message IO остается `O(E)` на итерацию. Message buckets уменьшают file-count и metadata overhead, но не меняют асимптотику. Message record больше edge record:
 
 ```text
 edge record:    int,int        = 8 bytes
@@ -284,7 +288,7 @@ message record: int,double     = 12 bytes
 
 Гипер-узел не разворачивается в adjacency list. Его ребра остаются последовательными records в source partition. Scatter читает partition потоково, а scheduling запускает более тяжелые partitions раньше.
 
-Если один source chunk содержит огромный гипер-узел, эта partition все равно может быть тяжелой. Текущая реализация балансирует partitions, но не делит один source partition на subranges.
+Если один source chunk содержит огромный гипер-узел, scatter режет файл source partition на byte-aligned edge slices и может распределить slices между worker buckets. Каждый slice читается позиционно и потоково; adjacency list по-прежнему не создается.
 
 ## Детерминизм
 
@@ -331,7 +335,7 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
   --input data/edges.csv \
   --output output/pagerank.csv \
   --workdir work \
-  --chunk-size 1000000 \
+  --chunk-size 100000 \
   --threads 8 \
   --damping 0.85 \
   --max-iterations 200 \
@@ -371,11 +375,13 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 
 - external sort implementation простой: chunk sort + k-way merge;
 - hot-path sort для endpoint refs/assignments использует primitive arrays, generic record sorter оставлен как fallback;
+- sort run metadata bounded: при превышении merge fan-in runs инкрементально compact-ятся;
 - preprocessing делает несколько disk passes;
 - messages занимают `O(E)` временного места на каждой итерации: на каждое ребро пишется record `int denseTo,double contribution` при наличии исходящей степени;
 - число unique observed vertices должно помещаться в `int denseId`;
 - `partitionCount = ceil(V / chunkSize)` должен помещаться в `int`;
 - preprocessing может требовать несколько размеров исходного edge storage во временном диске;
 - compression/checkpoint/resume пока нет;
+- recursive cleanup использует streaming `walkFileTree`, без materialization всех paths в heap;
 - `DiskDoubleArray` и `DiskIntArray` используют synchronized positional writes внутри одного handle; parallel gather открывает independent handles для непересекающихся destination ranges;
-- один сверхтяжелый source partition пока не дробится внутри partition.
+- очень маленький граф или один небольшой source slice не сможет загрузить все CPU независимо от `--threads`.

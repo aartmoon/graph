@@ -8,6 +8,7 @@ import org.example.largegraph.io.CsvEdgeReader.Edge;
 import org.example.largegraph.io.SourcePartitionWriterManager;
 import org.example.largegraph.storage.DiskDoubleArray;
 import org.example.largegraph.storage.DiskIntArray;
+import org.example.largegraph.util.FileUtils;
 import org.example.largegraph.util.ProgressLogger;
 
 import java.io.BufferedInputStream;
@@ -20,7 +21,6 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Comparator;
 import java.util.Optional;
 import java.util.Properties;
 
@@ -222,7 +222,6 @@ public final class GraphPreprocessor {
                 int[] outDegreeChunk = new int[sourceLength];
                 Path sourcePartitionPath = edgesDir().resolve("src-part-%05d.bin".formatted(sourcePartition));
                 if (!Files.exists(sourcePartitionPath)) {
-                    outDegree.writeIntChunk(sourceStart, outDegreeChunk, sourceLength);
                     continue;
                 }
 
@@ -384,14 +383,7 @@ public final class GraphPreprocessor {
     }
 
     private void deleteRecursively(Path path) throws IOException {
-        if (!Files.exists(path)) {
-            return;
-        }
-        try (var paths = Files.walk(path)) {
-            for (Path child : paths.sorted(Comparator.reverseOrder()).toList()) {
-                Files.deleteIfExists(child);
-            }
-        }
+        FileUtils.deleteRecursively(path);
     }
 
     private record FirstPassStats(long edgeCount) {

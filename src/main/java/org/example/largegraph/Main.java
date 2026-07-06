@@ -54,8 +54,12 @@ public final class Main {
         long pagerankChunkEstimate = safeMultiply(safeMultiply(config.chunkSize(), 64L), activeTasks);
         long intSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK), Integer.BYTES);
         long recordSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_RECORD_SORT_CHUNK), 32L);
+        long topKEstimate = safeMultiply(config.topK(), 32L);
         long maxHeap = MemoryUtils.maxHeapBytes();
-        long largestEstimate = Math.max(pagerankChunkEstimate, Math.max(intSortChunkEstimate, recordSortChunkEstimate));
+        long largestEstimate = Math.max(
+                Math.max(pagerankChunkEstimate, topKEstimate),
+                Math.max(intSortChunkEstimate, recordSortChunkEstimate)
+        );
         if (largestEstimate > maxHeap / 2) {
             logger.info("""
                     WARNING memory configuration may be risky:
@@ -63,12 +67,14 @@ public final class Main {
                       pagerankChunkEstimate=%s
                       intSortChunkEstimate=%s
                       recordSortChunkEstimate=%s
+                      topKEstimate=%s
                       consider --chunk-size 10000..100000 for -Xmx128m"""
                     .formatted(
                             MemoryUtils.humanReadableBytes(maxHeap),
                             MemoryUtils.humanReadableBytes(pagerankChunkEstimate),
                             MemoryUtils.humanReadableBytes(intSortChunkEstimate),
-                            MemoryUtils.humanReadableBytes(recordSortChunkEstimate)
+                            MemoryUtils.humanReadableBytes(recordSortChunkEstimate),
+                            MemoryUtils.humanReadableBytes(topKEstimate)
                     ));
         }
     }

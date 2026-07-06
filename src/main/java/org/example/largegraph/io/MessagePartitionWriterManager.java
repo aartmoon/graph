@@ -11,18 +11,22 @@ import java.util.Map;
 import java.util.TreeSet;
 
 public final class MessagePartitionWriterManager implements Closeable {
+    private static final int MAX_MESSAGE_BUCKETS = 8_192;
+
     private final Path workerDir;
     private final int destinationPartitionCount;
+    private final int bucketCount;
     private final int maxOpenWriters;
     private final Map<Integer, BinaryMessageWriter> writers;
-    private final TreeSet<Integer> touchedPartitions;
+    private final TreeSet<Integer> touchedBuckets;
 
     public MessagePartitionWriterManager(Path workerDir, int destinationPartitionCount, int maxOpenWriters) throws IOException {
         this.workerDir = workerDir;
         this.destinationPartitionCount = destinationPartitionCount;
+        this.bucketCount = Math.max(1, Math.min(destinationPartitionCount, MAX_MESSAGE_BUCKETS));
         this.maxOpenWriters = Math.max(1, maxOpenWriters);
         this.writers = new LinkedHashMap<>(16, 0.75f, true);
-        this.touchedPartitions = new TreeSet<>();
+        this.touchedBuckets = new TreeSet<>();
         Files.createDirectories(workerDir);
     }
 
@@ -30,23 +34,28 @@ public final class MessagePartitionWriterManager implements Closeable {
         if (destinationPartition < 0 || destinationPartition >= destinationPartitionCount) {
             throw new IllegalArgumentException("invalid destination partition: " + destinationPartition);
         }
-        touchedPartitions.add(destinationPartition);
-        writerFor(destinationPartition).write(to, contribution);
+        int bucket = bucketFor(destinationPartition);
+        touchedBuckets.add(bucket);
+        writerFor(bucket).write(to, contribution);
     }
 
-    public Path pathFor(int destinationPartition) {
-        return workerDir.resolve("msg-part-%05d.bin".formatted(destinationPartition));
+    public Path pathFor(int bucket) {
+        return workerDir.resolve("msg-bucket-%05d.bin".formatted(bucket));
     }
 
-    private BinaryMessageWriter writerFor(int partition) throws IOException {
-        BinaryMessageWriter writer = writers.get(partition);
+    private BinaryMessageWriter writerFor(int bucket) throws IOException {
+        BinaryMessageWriter writer = writers.get(bucket);
         if (writer != null) {
             return writer;
         }
         evictIfNeeded();
-        writer = new BinaryMessageWriter(pathFor(partition));
-        writers.put(partition, writer);
+        writer = new BinaryMessageWriter(pathFor(bucket));
+        writers.put(bucket, writer);
         return writer;
+    }
+
+    private int bucketFor(int destinationPartition) {
+        return destinationPartition % bucketCount;
     }
 
     private void evictIfNeeded() throws IOException {
@@ -85,8 +94,8 @@ public final class MessagePartitionWriterManager implements Closeable {
     private void writeManifest() throws IOException {
         Path manifest = workerDir.resolve("manifest.txt");
         try (var writer = Files.newBufferedWriter(manifest, StandardCharsets.UTF_8)) {
-            for (int partition : touchedPartitions) {
-                writer.write(Integer.toString(partition));
+            for (int bucket : touchedBuckets) {
+                writer.write(Integer.toString(bucket));
                 writer.newLine();
             }
         }

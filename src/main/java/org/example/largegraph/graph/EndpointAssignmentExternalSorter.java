@@ -1,5 +1,7 @@
 package org.example.largegraph.graph;
 
+import org.example.largegraph.util.FileUtils;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.Closeable;
@@ -50,10 +52,25 @@ final class EndpointAssignmentExternalSorter {
                         writer.write(chunk.edgeIds[i], chunk.sides[i], chunk.denseIds[i]);
                     }
                 }
-                runs.add(run);
+                addRunBounded(runs, run, tempDir, runPrefix);
             }
         }
         return runs;
+    }
+
+    private void addRunBounded(List<Path> runs, Path run, Path tempDir, String runPrefix) throws IOException {
+        runs.add(run);
+        if (runs.size() <= MAX_MERGE_FAN_IN) {
+            return;
+        }
+        List<Path> group = new ArrayList<>(runs.subList(0, MAX_MERGE_FAN_IN));
+        Path merged = tempDir.resolve("%s-incremental-merged-%05d.bin".formatted(runPrefix, System.nanoTime()));
+        merge(group, merged);
+        for (Path oldRun : group) {
+            Files.deleteIfExists(oldRun);
+        }
+        runs.subList(0, MAX_MERGE_FAN_IN).clear();
+        runs.add(merged);
     }
 
     private List<Path> compactRuns(List<Path> runs, Path tempDir, String runPrefix) throws IOException {
@@ -213,14 +230,7 @@ final class EndpointAssignmentExternalSorter {
     }
 
     private void deleteRecursively(Path path) throws IOException {
-        if (!Files.exists(path)) {
-            return;
-        }
-        try (var paths = Files.walk(path)) {
-            for (Path child : paths.sorted(Comparator.reverseOrder()).toList()) {
-                Files.deleteIfExists(child);
-            }
-        }
+        FileUtils.deleteRecursively(path);
     }
 
     private static final class Chunk {

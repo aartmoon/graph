@@ -34,7 +34,7 @@ final class PageRankEngineTest {
         RunResult run = run(input, tempDir.resolve("cycle"), 2, 50);
         double[] ranks = readAllRanks(run.result());
 
-        assertEquals(1.0, sum(ranks), 1e-9);
+        assertEquals(1.0, sumRanksStreaming(run.result()), 1e-9);
         assertEquals(ranks[0], ranks[1], 1e-9);
         assertEquals(ranks[1], ranks[2], 1e-9);
     }
@@ -47,7 +47,7 @@ final class PageRankEngineTest {
         RunResult run = run(input, tempDir.resolve("dangling"), 2, 50);
         double[] ranks = readAllRanks(run.result());
 
-        assertEquals(1.0, sum(ranks), 1e-9);
+        assertEquals(1.0, sumRanksStreaming(run.result()), 1e-9);
         assertTrue(ranks[1] > ranks[0]);
     }
 
@@ -100,11 +100,10 @@ final class PageRankEngineTest {
         Files.writeString(input, csv);
 
         RunResult run = run(input, tempDir.resolve("hyper"), 1_024, 3);
-        double[] ranks = readAllRanks(run.result());
 
         System.gc();
         assertEquals(10_000, run.result().vertexCount());
-        assertEquals(1.0, sum(ranks), 1e-9);
+        assertEquals(1.0, sumRanksStreaming(run.result()), 1e-9);
         assertTrue(MemoryUtils.usedHeapBytes() < 128L * 1024L * 1024L);
     }
 
@@ -121,10 +120,9 @@ final class PageRankEngineTest {
         Path output = tempDir.resolve("boundary-output.csv");
         RunResult run = run(input, tempDir.resolve("boundary"), output, 4, 30);
         new PageRankResultWriter(run.config()).write(run.result());
-        double[] ranks = readAllRanks(run.result());
 
         assertEquals(3, run.result().vertexCount());
-        assertEquals(1.0, sum(ranks), 1e-9);
+        assertEquals(1.0, sumRanksStreaming(run.result()), 1e-9);
         assertTrue(Files.readString(output).contains("5,"));
     }
 
@@ -138,10 +136,10 @@ final class PageRankEngineTest {
         }
 
         assertEquals(List.of("0", "2"), Files.readAllLines(workerDir.resolve("manifest.txt")));
-        assertTrue(Files.exists(workerDir.resolve("msg-part-00000.bin")));
-        assertTrue(Files.exists(workerDir.resolve("msg-part-00002.bin")));
-        assertTrue(Files.notExists(workerDir.resolve("msg-part-00001.bin")));
-        assertTrue(Files.notExists(workerDir.resolve("msg-part-00003.bin")));
+        assertTrue(Files.exists(workerDir.resolve("msg-bucket-00000.bin")));
+        assertTrue(Files.exists(workerDir.resolve("msg-bucket-00002.bin")));
+        assertTrue(Files.notExists(workerDir.resolve("msg-bucket-00001.bin")));
+        assertTrue(Files.notExists(workerDir.resolve("msg-bucket-00003.bin")));
     }
 
     @Test
@@ -194,10 +192,16 @@ final class PageRankEngineTest {
         }
     }
 
-    private static double sum(double[] values) {
+    private static double sumRanksStreaming(PageRankEngine.PageRankRunResult result) throws IOException {
         double sum = 0.0;
-        for (double value : values) {
-            sum += value;
+        try (DiskDoubleArray ranks = new DiskDoubleArray(result.rankPath(), result.vertexCount(), 1_024, false)) {
+            for (long start = 0; start < result.vertexCount(); start += 1_024) {
+                int length = (int) Math.min(1_024, result.vertexCount() - start);
+                double[] chunk = ranks.readChunk(start, length);
+                for (double value : chunk) {
+                    sum += value;
+                }
+            }
         }
         return sum;
     }

@@ -56,7 +56,7 @@ public final class ArgsParser {
                     --input data/edges.csv \\
                     --output output/pagerank.csv \\
                     --workdir work \\
-                    --chunk-size 1000000 \\
+                    --chunk-size 100000 \\
                     --threads 8 \\
                     --damping 0.85 \\
                     --max-iterations 200 \\
