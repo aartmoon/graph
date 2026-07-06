@@ -6,13 +6,14 @@ public record AppConfig(
         Path input,
         Path output,
         Path workDir,
-        int partitions,
+        int chunkSize,
         int threads,
         double damping,
         int maxIterations,
         double epsilon,
         IdMode idMode,
-        boolean sortByRank
+        int topK,
+        boolean keepMessages
 ) {
     public AppConfig {
         if (input == null) {
@@ -24,8 +25,8 @@ public record AppConfig(
         if (workDir == null) {
             throw new IllegalArgumentException("--workdir is required");
         }
-        if (partitions <= 0) {
-            throw new IllegalArgumentException("--partitions must be positive");
+        if (chunkSize <= 0) {
+            throw new IllegalArgumentException("--chunk-size must be positive");
         }
         if (threads <= 0) {
             throw new IllegalArgumentException("--threads must be positive");
@@ -41,6 +42,9 @@ public record AppConfig(
         }
         if (idMode == null) {
             throw new IllegalArgumentException("--id-mode is required");
+        }
+        if (topK < 0) {
+            throw new IllegalArgumentException("--top-k must be non-negative");
         }
     }
 

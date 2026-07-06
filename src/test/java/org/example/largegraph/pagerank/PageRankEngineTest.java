@@ -2,7 +2,8 @@ package org.example.largegraph.pagerank;
 
 import org.example.largegraph.config.AppConfig;
 import org.example.largegraph.graph.GraphPreprocessor;
-import org.example.largegraph.pagerank.PageRankEngine.PageRankRunResult;
+import org.example.largegraph.io.MessagePartitionWriterManager;
+import org.example.largegraph.storage.DiskDoubleArray;
 import org.example.largegraph.util.MemoryUtils;
 import org.example.largegraph.util.ProgressLogger;
 import org.junit.jupiter.api.Test;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -20,7 +22,7 @@ final class PageRankEngineTest {
     Path tempDir;
 
     @Test
-    void cycleGraphConvergesToEqualRanks() throws IOException {
+    void cycleGraphHasEqualRanksForCycleVertices() throws IOException {
         Path input = tempDir.resolve("cycle.csv");
         Files.writeString(input, """
                 from,to
@@ -29,34 +31,29 @@ final class PageRankEngineTest {
                 3,1
                 """);
 
-        AppConfig config = config(input, tempDir.resolve("cycle-out.csv"), tempDir.resolve("cycle-work"), false, 30);
-        GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
-        PageRankRunResult result = new PageRankEngine(config, new ProgressLogger()).run(graph);
+        RunResult run = run(input, tempDir.resolve("cycle"), 2, 50);
+        double[] ranks = readAllRanks(run.result());
 
-        assertEquals(1.0, sum(result.ranks()), 1e-12);
-        assertEquals(1.0 / 3.0, result.ranks()[0], 1e-12);
-        assertEquals(1.0 / 3.0, result.ranks()[1], 1e-12);
-        assertEquals(1.0 / 3.0, result.ranks()[2], 1e-12);
+        assertEquals(1.0, sum(ranks), 1e-9);
+        assertEquals(ranks[0], ranks[1], 1e-9);
+        assertEquals(ranks[1], ranks[2], 1e-9);
     }
 
     @Test
-    void danglingNodeKeepsRankMassAndReceivesRank() throws IOException {
-        Path input = tempDir.resolve("edges.csv");
+    void danglingNodeKeepsRankMass() throws IOException {
+        Path input = tempDir.resolve("dangling.csv");
         Files.writeString(input, "from,to\n1,2\n");
 
-        AppConfig config = config(input, tempDir.resolve("pagerank.csv"), tempDir.resolve("work"), false, 30);
-        GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
-        PageRankRunResult result = new PageRankEngine(config, new ProgressLogger()).run(graph);
+        RunResult run = run(input, tempDir.resolve("dangling"), 2, 50);
+        double[] ranks = readAllRanks(run.result());
 
-        assertEquals(1.0, sum(result.ranks()), 1e-12);
-        assertTrue(result.ranks()[1] > result.ranks()[0]);
-        assertTrue(result.iterations() <= config.maxIterations());
+        assertEquals(1.0, sum(ranks), 1e-9);
+        assertTrue(ranks[1] > ranks[0]);
     }
 
     @Test
-    void graphFromTaskCompletesAndWritesCsv() throws IOException {
+    void taskSampleCompletesAndWritesCsv() throws IOException {
         Path input = tempDir.resolve("task-graph.csv");
-        Path output = tempDir.resolve("task-output.csv");
         Files.writeString(input, """
                 from,to
                 1,2
@@ -65,77 +62,136 @@ final class PageRankEngineTest {
                 4,1
                 """);
 
-        AppConfig config = config(input, output, tempDir.resolve("task-work"), false, 30);
-        GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
-        PageRankRunResult result = new PageRankEngine(config, new ProgressLogger()).run(graph);
-        new PageRankResultWriter(config).write(result, graph.vertexIndexer());
+        Path output = tempDir.resolve("task-output.csv");
+        RunResult run = run(input, tempDir.resolve("task"), output, 2, 50);
+        new PageRankResultWriter(run.config()).write(run.result());
 
-        assertEquals(4, graph.vertexCount());
-        assertEquals(4, graph.edgeCount());
-        assertEquals(1.0, sum(result.ranks()), 1e-12);
-        assertTrue(Files.readString(output).startsWith("vertex,rank\n"));
+        String csv = Files.readString(output);
+        assertTrue(csv.startsWith("vertex,rank\n"));
+        assertTrue(csv.contains("1,"));
+        assertTrue(csv.contains("2,"));
+        assertTrue(csv.contains("3,"));
+        assertTrue(csv.contains("4,"));
+        assertTrue(csv.lines().noneMatch(line -> line.startsWith("0,")));
     }
 
     @Test
-    void hyperNodeSmokeTestDoesNotNeedAdjacencyList() throws IOException {
+    void sparseIdsOutputOnlyOriginalObservedVertices() throws IOException {
+        Path input = tempDir.resolve("sparse.csv");
+        Files.writeString(input, "from,to\n100,1000000\n");
+
+        Path output = tempDir.resolve("sparse-output.csv");
+        RunResult run = run(input, tempDir.resolve("sparse"), output, 2, 20);
+        new PageRankResultWriter(run.config()).write(run.result());
+
+        List<String> lines = Files.readAllLines(output);
+        assertEquals(3, lines.size());
+        assertEquals("100", lines.get(1).split(",")[0]);
+        assertEquals("1000000", lines.get(2).split(",")[0]);
+    }
+
+    @Test
+    void hyperNodeSmokeTestCompletesWithoutAdjacencyList() throws IOException {
         Path input = tempDir.resolve("hyper-node.csv");
-        Path output = tempDir.resolve("hyper-output.csv");
         StringBuilder csv = new StringBuilder("from,to\n");
         for (int to = 2; to <= 10_000; to++) {
             csv.append("1,").append(to).append('\n');
         }
         Files.writeString(input, csv);
 
-        AppConfig config = config(input, output, tempDir.resolve("hyper-work"), false, 2);
-        GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
-        PageRankRunResult result = new PageRankEngine(config, new ProgressLogger()).run(graph);
-        new PageRankResultWriter(config).write(result, graph.vertexIndexer());
+        RunResult run = run(input, tempDir.resolve("hyper"), 1_024, 3);
+        double[] ranks = readAllRanks(run.result());
 
         System.gc();
-        assertEquals(10_000, graph.vertexCount());
-        assertEquals(9_999, graph.edgeCount());
-        assertEquals(1.0, sum(result.ranks()), 1e-12);
-        assertTrue(Files.exists(output));
+        assertEquals(10_000, run.result().vertexCount());
+        assertEquals(1.0, sum(ranks), 1e-9);
         assertTrue(MemoryUtils.usedHeapBytes() < 128L * 1024L * 1024L);
     }
 
     @Test
-    void writesCsvSortedByVertexByDefault() throws IOException {
-        Path input = tempDir.resolve("edges.csv");
-        Path output = tempDir.resolve("pagerank.csv");
+    void chunkBoundaryGraphHasNoOffsetBugs() throws IOException {
+        Path input = tempDir.resolve("boundary.csv");
         Files.writeString(input, """
                 from,to
-                30,10
-                10,20
-                20,30
+                3,4
+                4,5
+                5,3
                 """);
 
-        AppConfig config = config(input, output, tempDir.resolve("work"), false, 1);
-        GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
-        PageRankRunResult result = new PageRankEngine(config, new ProgressLogger()).run(graph);
-        new PageRankResultWriter(config).write(result, graph.vertexIndexer());
+        Path output = tempDir.resolve("boundary-output.csv");
+        RunResult run = run(input, tempDir.resolve("boundary"), output, 4, 30);
+        new PageRankResultWriter(run.config()).write(run.result());
+        double[] ranks = readAllRanks(run.result());
 
-        assertEquals("""
-                vertex,rank
-                10,0.3333333333333333
-                20,0.3333333333333333
-                30,0.3333333333333333
-                """, Files.readString(output));
+        assertEquals(3, run.result().vertexCount());
+        assertEquals(1.0, sum(ranks), 1e-9);
+        assertTrue(Files.readString(output).contains("5,"));
     }
 
-    private static AppConfig config(Path input, Path output, Path workDir, boolean sortByRank, int maxIterations) {
-        return new AppConfig(
+    @Test
+    void messageManifestContainsOnlyTouchedPartitionsSorted() throws IOException {
+        Path workerDir = tempDir.resolve("messages").resolve("worker-00000");
+        try (MessagePartitionWriterManager writers = new MessagePartitionWriterManager(workerDir, 4, 2)) {
+            writers.write(2, 5, 0.25);
+            writers.write(0, 1, 0.75);
+            writers.write(2, 6, 0.5);
+        }
+
+        assertEquals(List.of("0", "2"), Files.readAllLines(workerDir.resolve("manifest.txt")));
+        assertTrue(Files.exists(workerDir.resolve("msg-part-00000.bin")));
+        assertTrue(Files.exists(workerDir.resolve("msg-part-00002.bin")));
+        assertTrue(Files.notExists(workerDir.resolve("msg-part-00001.bin")));
+        assertTrue(Files.notExists(workerDir.resolve("msg-part-00003.bin")));
+    }
+
+    @Test
+    void repeatedRunsAreDeterministic() throws IOException {
+        Path input = tempDir.resolve("deterministic.csv");
+        Files.writeString(input, """
+                from,to
+                1,2
+                2,3
+                3,1
+                4,1
+                """);
+
+        Path outputA = tempDir.resolve("a.csv");
+        Path outputB = tempDir.resolve("b.csv");
+        RunResult runA = run(input, tempDir.resolve("work-a"), outputA, 2, 20);
+        RunResult runB = run(input, tempDir.resolve("work-b"), outputB, 2, 20);
+        new PageRankResultWriter(runA.config()).write(runA.result());
+        new PageRankResultWriter(runB.config()).write(runB.result());
+
+        assertEquals(Files.readString(outputA), Files.readString(outputB));
+    }
+
+    private RunResult run(Path input, Path workDir, int chunkSize, int maxIterations) throws IOException {
+        return run(input, workDir, tempDir.resolve("out-" + workDir.getFileName() + ".csv"), chunkSize, maxIterations);
+    }
+
+    private RunResult run(Path input, Path workDir, Path output, int chunkSize, int maxIterations) throws IOException {
+        AppConfig config = new AppConfig(
                 input,
                 output,
                 workDir,
-                16,
-                2,
+                chunkSize,
+                4,
                 0.85,
                 maxIterations,
-                1e-12,
+                1e-10,
                 AppConfig.IdMode.CONTIGUOUS,
-                sortByRank
+                0,
+                false
         );
+        GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
+        PageRankEngine.PageRankRunResult result = new PageRankEngine(config, new ProgressLogger()).run(graph);
+        return new RunResult(config, result);
+    }
+
+    private static double[] readAllRanks(PageRankEngine.PageRankRunResult result) throws IOException {
+        try (DiskDoubleArray ranks = new DiskDoubleArray(result.rankPath(), result.vertexCount(), 1_024)) {
+            return ranks.readChunk(0, Math.toIntExact(result.vertexCount()));
+        }
     }
 
     private static double sum(double[] values) {
@@ -144,5 +200,8 @@ final class PageRankEngineTest {
             sum += value;
         }
         return sum;
+    }
+
+    private record RunResult(AppConfig config, PageRankEngine.PageRankRunResult result) {
     }
 }

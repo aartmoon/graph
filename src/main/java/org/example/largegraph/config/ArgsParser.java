@@ -10,33 +10,42 @@ public final class ArgsParser {
             "--input",
             "--output",
             "--workdir",
-            "--partitions",
+            "--chunk-size",
             "--threads",
             "--damping",
             "--max-iterations",
             "--epsilon",
             "--id-mode",
-            "--sort-by-rank"
+            "--top-k",
+            "--keep-messages"
     );
+
+    private static final double DEFAULT_DAMPING = 0.85;
+    private static final int DEFAULT_MAX_ITERATIONS = 200;
+    private static final double DEFAULT_EPSILON = 1e-8;
+    private static final AppConfig.IdMode DEFAULT_ID_MODE = AppConfig.IdMode.CONTIGUOUS;
+    private static final int DEFAULT_TOP_K = 0;
+    private static final boolean DEFAULT_KEEP_MESSAGES = false;
 
     private ArgsParser() {
     }
 
     public static AppConfig parse(String[] args) {
         Map<String, String> values = parsePairs(args);
-        requireAll(values);
+        requireRequired(values);
 
         return new AppConfig(
                 Path.of(values.get("--input")),
                 Path.of(values.get("--output")),
                 Path.of(values.get("--workdir")),
-                parsePositiveInt(values, "--partitions"),
+                parsePositiveInt(values, "--chunk-size"),
                 parsePositiveInt(values, "--threads"),
-                parseDouble(values, "--damping"),
-                parsePositiveInt(values, "--max-iterations"),
-                parseDouble(values, "--epsilon"),
-                AppConfig.IdMode.fromCliValue(values.get("--id-mode")),
-                parseBoolean(values.get("--sort-by-rank"), "--sort-by-rank")
+                parseDouble(values, "--damping", DEFAULT_DAMPING),
+                parsePositiveInt(values, "--max-iterations", DEFAULT_MAX_ITERATIONS),
+                parseDouble(values, "--epsilon", DEFAULT_EPSILON),
+                values.containsKey("--id-mode") ? AppConfig.IdMode.fromCliValue(values.get("--id-mode")) : DEFAULT_ID_MODE,
+                parseNonNegativeInt(values, "--top-k", DEFAULT_TOP_K),
+                parseBoolean(values, "--keep-messages", DEFAULT_KEEP_MESSAGES)
         );
     }
 
@@ -47,13 +56,14 @@ public final class ArgsParser {
                     --input data/edges.csv \\
                     --output output/pagerank.csv \\
                     --workdir work \\
-                    --partitions 64 \\
+                    --chunk-size 1000000 \\
                     --threads 8 \\
                     --damping 0.85 \\
-                    --max-iterations 30 \\
+                    --max-iterations 200 \\
                     --epsilon 1e-8 \\
                     --id-mode contiguous \\
-                    --sort-by-rank false
+                    --top-k 0 \\
+                    --keep-messages false
                 """;
     }
 
@@ -79,8 +89,8 @@ public final class ArgsParser {
         return values;
     }
 
-    private static void requireAll(Map<String, String> values) {
-        for (String option : KNOWN_OPTIONS) {
+    private static void requireRequired(Map<String, String> values) {
+        for (String option : Set.of("--input", "--output", "--workdir", "--chunk-size", "--threads")) {
             if (!values.containsKey(option)) {
                 throw new IllegalArgumentException("missing required option: " + option);
             }
@@ -88,6 +98,13 @@ public final class ArgsParser {
     }
 
     private static int parsePositiveInt(Map<String, String> values, String option) {
+        return parsePositiveInt(values, option, null);
+    }
+
+    private static int parsePositiveInt(Map<String, String> values, String option, Integer defaultValue) {
+        if (!values.containsKey(option)) {
+            return defaultValue;
+        }
         try {
             int parsed = Integer.parseInt(values.get(option));
             if (parsed <= 0) {
@@ -99,7 +116,25 @@ public final class ArgsParser {
         }
     }
 
-    private static double parseDouble(Map<String, String> values, String option) {
+    private static int parseNonNegativeInt(Map<String, String> values, String option, int defaultValue) {
+        if (!values.containsKey(option)) {
+            return defaultValue;
+        }
+        try {
+            int parsed = Integer.parseInt(values.get(option));
+            if (parsed < 0) {
+                throw new IllegalArgumentException(option + " must be non-negative");
+            }
+            return parsed;
+        } catch (NumberFormatException ex) {
+            throw new IllegalArgumentException(option + " must be an integer", ex);
+        }
+    }
+
+    private static double parseDouble(Map<String, String> values, String option, double defaultValue) {
+        if (!values.containsKey(option)) {
+            return defaultValue;
+        }
         try {
             double parsed = Double.parseDouble(values.get(option));
             if (Double.isNaN(parsed) || Double.isInfinite(parsed)) {
@@ -111,7 +146,11 @@ public final class ArgsParser {
         }
     }
 
-    private static boolean parseBoolean(String value, String option) {
+    private static boolean parseBoolean(Map<String, String> values, String option, boolean defaultValue) {
+        if (!values.containsKey(option)) {
+            return defaultValue;
+        }
+        String value = values.get(option);
         if ("true".equalsIgnoreCase(value)) {
             return true;
         }

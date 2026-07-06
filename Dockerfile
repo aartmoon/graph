@@ -1,8 +1,10 @@
-FROM gradle:8.9-jdk21 AS build
+FROM eclipse-temurin:21-jdk AS build
 WORKDIR /app
-COPY settings.gradle build.gradle ./
+COPY gradlew gradlew.bat settings.gradle build.gradle ./
+COPY gradle ./gradle
 COPY src ./src
-RUN gradle --no-daemon clean installDist
+RUN chmod +x ./gradlew
+RUN ./gradlew --no-daemon clean installDist
 
 FROM eclipse-temurin:21-jre
 WORKDIR /app

@@ -16,6 +16,12 @@ application {
     mainClass = 'org.example.largegraph.Main'
 }
 
+jar {
+    manifest {
+        attributes 'Main-Class': application.mainClass.get()
+    }
+}
+
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
 }
@@ -27,4 +33,5 @@ tasks.withType(Test).configureEach {
 dependencies {
     testImplementation platform('org.junit:junit-bom:5.10.3')
     testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }

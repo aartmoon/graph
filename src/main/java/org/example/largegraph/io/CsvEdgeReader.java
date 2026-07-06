@@ -37,8 +37,9 @@ public final class CsvEdgeReader implements Closeable {
 
     private Edge parseEdge(String line) {
         String[] parts = line.split(",", -1);
-        if (parts.length != 2) {
-            throw new IllegalArgumentException("invalid CSV edge at line " + lineNumber + ": " + line);
+        if (parts.length < 2) {
+            throw new IllegalArgumentException("invalid CSV edge at line " + lineNumber
+                    + ": expected at least two columns, got " + parts.length + ": " + line);
         }
         if (parts[0].isBlank() || parts[1].isBlank()) {
             throw new IllegalArgumentException("empty vertex id at line " + lineNumber + ": " + line);
@@ -51,7 +52,10 @@ public final class CsvEdgeReader implements Closeable {
     }
 
     private boolean isHeader(String line) {
-        return "from,to".equalsIgnoreCase(line.replace(" ", ""));
+        String[] parts = line.split(",", -1);
+        return parts.length >= 2
+                && "from".equalsIgnoreCase(parts[0].trim())
+                && "to".equalsIgnoreCase(parts[1].trim());
     }
 
     @Override

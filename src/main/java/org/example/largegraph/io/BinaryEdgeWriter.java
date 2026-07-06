@@ -6,6 +6,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 
 public final class BinaryEdgeWriter implements Closeable {
     private final DataOutputStream output;
@@ -15,7 +16,11 @@ public final class BinaryEdgeWriter implements Closeable {
         if (path.getParent() != null) {
             Files.createDirectories(path.getParent());
         }
-        this.output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)));
+        this.output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(
+                path,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND
+        )));
     }
 
     public void write(int denseFrom, int denseTo) throws IOException {

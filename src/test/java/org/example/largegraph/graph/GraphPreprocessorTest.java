@@ -1,16 +1,15 @@
 package org.example.largegraph.graph;
 
 import org.example.largegraph.config.AppConfig;
+import org.example.largegraph.storage.DiskIntArray;
 import org.example.largegraph.util.ProgressLogger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.DataInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -20,7 +19,7 @@ final class GraphPreprocessorTest {
     Path tempDir;
 
     @Test
-    void createsPreprocessingFilesWithoutKeepingEdgesInMemory() throws IOException {
+    void createsExternalMemoryPreprocessingFiles() throws IOException {
         Path input = tempDir.resolve("edges.csv");
         Path output = tempDir.resolve("output").resolve("pagerank.csv");
         Path workDir = tempDir.resolve("work");
@@ -32,22 +31,70 @@ final class GraphPreprocessorTest {
                 30,10
                 """);
 
-        AppConfig config = config(input, output, workDir, 4);
+        AppConfig config = config(input, output, workDir, 8, 4);
         GraphPreprocessor.PreprocessingResult result = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
 
         assertEquals(3, result.vertexCount());
         assertEquals(4, result.edgeCount());
-        assertTrue(Files.exists(workDir.resolve("out_degree.bin")));
-        assertTrue(Files.exists(workDir.resolve("vertex_ids.bin")));
-        assertTrue(Files.exists(workDir.resolve("current_rank.bin")));
-        assertTrue(Files.exists(workDir.resolve("next_rank.bin")));
+        assertEquals(1, result.sourcePartitionCount());
+        assertTrue(Files.exists(workDir.resolve("meta.properties")));
+        assertTrue(Files.exists(workDir.resolve("vertices.bin")));
+        assertTrue(Files.exists(workDir.resolve("mapping.bin")));
+        assertTrue(Files.exists(workDir.resolve("vertex").resolve("out_degree.bin")));
+        assertTrue(Files.exists(workDir.resolve("vertex").resolve("rank_current.bin")));
+        assertTrue(Files.exists(workDir.resolve("vertex").resolve("rank_next.bin")));
+        assertTrue(Files.exists(workDir.resolve("edges_by_source").resolve("src-part-00000.bin")));
 
-        for (int partition = 0; partition < 4; partition++) {
-            assertTrue(Files.exists(workDir.resolve("partitions").resolve("part-%05d.bin".formatted(partition))));
+        try (DiskIntArray outDegree = new DiskIntArray(result.outDegreePath(), result.vertexCount(), result.chunkSize())) {
+            assertEquals(2, outDegree.getInt(0));
+            assertEquals(1, outDegree.getInt(1));
+            assertEquals(1, outDegree.getInt(2));
         }
+        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), result.chunkSize())) {
+            assertEquals(10, vertices.getInt(0));
+            assertEquals(20, vertices.getInt(1));
+            assertEquals(30, vertices.getInt(2));
+        }
+    }
 
-        assertArrayEquals(new int[]{2, 1, 1}, readInts(workDir.resolve("out_degree.bin"), 3));
-        assertArrayEquals(new int[]{10, 20, 30}, readInts(workDir.resolve("vertex_ids.bin"), 3));
+    @Test
+    void sparseOriginalIdsCreateOnlyObservedDenseVertices() throws IOException {
+        Path input = tempDir.resolve("sparse.csv");
+        Path output = tempDir.resolve("output").resolve("pagerank.csv");
+        Path workDir = tempDir.resolve("sparse-work");
+        Files.writeString(input, "from,to\n100,1000000\n");
+
+        AppConfig config = config(input, output, workDir, 4, 2);
+        GraphPreprocessor.PreprocessingResult result = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
+
+        assertEquals(2, result.vertexCount());
+        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), result.chunkSize())) {
+            assertEquals(100, vertices.getInt(0));
+            assertEquals(1_000_000, vertices.getInt(1));
+        }
+    }
+
+    @Test
+    void csvReaderUsesFirstTwoColumnsAndIgnoresExtraColumns() throws IOException {
+        Path input = tempDir.resolve("extra-columns.csv");
+        Path output = tempDir.resolve("output").resolve("pagerank.csv");
+        Path workDir = tempDir.resolve("extra-columns-work");
+        Files.writeString(input, """
+                from,to,weight,comment
+                1,2,10,abc
+                2,3,20,def
+                """);
+
+        AppConfig config = config(input, output, workDir, 4, 2);
+        GraphPreprocessor.PreprocessingResult result = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
+
+        assertEquals(3, result.vertexCount());
+        assertEquals(2, result.edgeCount());
+        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), result.chunkSize())) {
+            assertEquals(1, vertices.getInt(0));
+            assertEquals(2, vertices.getInt(1));
+            assertEquals(3, vertices.getInt(2));
+        }
     }
 
     @Test
@@ -55,7 +102,7 @@ final class GraphPreprocessorTest {
         Path input = tempDir.resolve("edges.csv");
         Files.writeString(input, "from,to\n-1,2\n");
 
-        AppConfig config = config(input, tempDir.resolve("out.csv"), tempDir.resolve("work"), 2);
+        AppConfig config = config(input, tempDir.resolve("out.csv"), tempDir.resolve("work"), 4, 2);
 
         assertThrows(IllegalArgumentException.class,
                 () -> new GraphPreprocessor(config, new ProgressLogger()).preprocess());
@@ -66,34 +113,25 @@ final class GraphPreprocessorTest {
         Path input = tempDir.resolve("edges.csv");
         Files.writeString(input, "from,to\n");
 
-        AppConfig config = config(input, tempDir.resolve("out.csv"), tempDir.resolve("work"), 2);
+        AppConfig config = config(input, tempDir.resolve("out.csv"), tempDir.resolve("work"), 4, 2);
 
         assertThrows(IllegalArgumentException.class,
                 () -> new GraphPreprocessor(config, new ProgressLogger()).preprocess());
     }
 
-    private static AppConfig config(Path input, Path output, Path workDir, int partitions) {
+    private static AppConfig config(Path input, Path output, Path workDir, int chunkSize, int threads) {
         return new AppConfig(
                 input,
                 output,
                 workDir,
-                partitions,
-                2,
+                chunkSize,
+                threads,
                 0.85,
                 30,
                 1e-8,
                 AppConfig.IdMode.CONTIGUOUS,
+                0,
                 false
         );
-    }
-
-    private static int[] readInts(Path path, int count) throws IOException {
-        int[] values = new int[count];
-        try (DataInputStream input = new DataInputStream(Files.newInputStream(path))) {
-            for (int i = 0; i < count; i++) {
-                values[i] = input.readInt();
-            }
-        }
-        return values;
     }
 }
