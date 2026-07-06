@@ -1,5 +1,233 @@
 # External-Memory PageRank на Java 21
 
+## Статус реализации
+
+Репозиторий содержит Java 21 / Gradle проект для semi-external memory PageRank:
+
+- создан CLI с валидацией аргументов;
+- реализован preprocessing pipeline: потоковое чтение CSV, in-memory vertex indexing, подсчет `outDegree`, запись modulo destination-partitioned binary edge-файлов;
+- создаются `out_degree.bin`, `vertex_ids.bin`, `current_rank.bin`, `next_rank.bin`;
+- реализован итерационный `PageRankEngine` поверх подготовленных файлов;
+- edge partitions обрабатываются параллельно через `ExecutorService`;
+- `danglingMass`, base term, L1 diff и остановка по `epsilon` / `maxIterations` реализованы;
+- создан writer итогового CSV;
+- добавлены JUnit-тесты для CLI parser, preprocessing и PageRankEngine.
+
+### Что хранится в памяти сейчас
+
+Текущая реализация является semi-external memory подходом: главный большой объект `E` ребер остается на диске, а CSV и binary partitions читаются потоково. Adjacency list и полный edge list в памяти не создаются.
+
+В памяти в текущей версии находятся:
+
+- in-memory mapping `original vertex id -> internal dense id`;
+- обратный список `internal dense id -> original vertex id`;
+- массив `outDegree[int]` на `N` вершин;
+- массив `currentRank[double]` на `N` вершин;
+- массив `nextRank[double]` на `N` вершин;
+- небольшие IO-буферы для чтения CSV и записи бинарных файлов.
+
+Это честное ограничение текущей версии. Если `V` тоже не помещается в RAM, mapping, `outDegree`, `currentRank` и `nextRank` нужно заменить на external sort / external join, memory-mapped или chunked rank store.
+
+### Сборка
+
+```bash
+gradle test
+gradle run --args="--input data/edges.csv --output output/pagerank.csv --workdir work --partitions 64 --threads 8 --damping 0.85 --max-iterations 30 --epsilon 1e-8 --id-mode contiguous --sort-by-rank false"
+```
+
+### Запуск тестов
+
+```bash
+gradle test
+```
+
+Тестовый набор покрывает:
+
+- cycle graph `1 -> 2 -> 3 -> 1`, где ранги должны быть равны;
+- dangling node graph `1 -> 2`, где сумма PageRank сохраняется около `1.0`;
+- граф из задания `1 -> 2`, `2 -> 3`, `3 -> 1`, `4 -> 1`;
+- hyper-node smoke test `1 -> 2..10000`, который проверяет, что код проходит без построения adjacency list.
+
+### Пример запуска с 128 MB heap
+
+```bash
+gradle installDist
+java -Xmx128m \
+  -cp build/install/largegraph-pagerank/lib/largegraph-pagerank-0.1.0.jar \
+  org.example.largegraph.Main \
+  --input data/edges.csv \
+  --output output/pagerank.csv \
+  --workdir work \
+  --partitions 64 \
+  --threads 8 \
+  --damping 0.85 \
+  --max-iterations 30 \
+  --epsilon 1e-8 \
+  --id-mode contiguous \
+  --sort-by-rank false
+```
+
+### Docker
+
+```bash
+docker build -t largegraph-pagerank .
+docker run --rm \
+  -v "$PWD/data:/app/data" \
+  -v "$PWD/output:/app/output" \
+  -v "$PWD/work:/app/work" \
+  largegraph-pagerank \
+  --input data/edges.csv \
+  --output output/pagerank.csv \
+  --workdir work \
+  --partitions 64 \
+  --threads 8 \
+  --damping 0.85 \
+  --max-iterations 30 \
+  --epsilon 1e-8 \
+  --id-mode contiguous \
+  --sort-by-rank false
+```
+
+## How To Reproduce Results
+
+1. Проверьте Java:
+
+```bash
+java -version
+```
+
+Ожидается Java 21.
+
+2. Запустите тесты:
+
+```bash
+gradle test
+```
+
+3. Запустите пример:
+
+```bash
+gradle run --args="--input data/edges.csv --output output/pagerank.csv --workdir work --partitions 64 --threads 8 --damping 0.85 --max-iterations 30 --epsilon 1e-8 --id-mode contiguous --sort-by-rank false"
+```
+
+4. Посмотрите результат:
+
+```bash
+cat output/pagerank.csv
+```
+
+5. Для сортировки по рангу:
+
+```bash
+gradle run --args="--input data/edges.csv --output output/pagerank-by-rank.csv --workdir work --partitions 64 --threads 8 --damping 0.85 --max-iterations 30 --epsilon 1e-8 --id-mode contiguous --sort-by-rank true"
+```
+
+## RAM And Disk Layout
+
+В текущей версии в RAM находятся:
+
+- `HashMap<Integer, Integer>` для mapping `original vertex id -> internal dense id`;
+- `ArrayList<Integer>` для восстановления `internal dense id -> original vertex id`;
+- `int[] outDegree`;
+- `double[] currentRank`;
+- `double[] nextRank`;
+- небольшие `BufferedReader`, `BufferedOutputStream`, `DataInputStream`, `DataOutputStream` буферы.
+
+На диске находятся:
+
+- исходный CSV `data/edges.csv`;
+- edge partitions `work/partitions/part-xxxxx.bin`;
+- `work/out_degree.bin`;
+- `work/vertex_ids.bin`;
+- `work/current_rank.bin`;
+- `work/next_rank.bin`;
+- итоговый CSV `output/pagerank.csv`.
+
+Почему нет `O(E)` RAM:
+
+- входной CSV читается потоково;
+- preprocessing не сохраняет список ребер в коллекции;
+- каждое ребро сразу записывается в binary partition;
+- PageRankEngine читает partition-файлы потоково на каждой итерации;
+- adjacency list для source-вершин не строится.
+
+Текущая память зависит в основном от `V`, а не от `E`:
+
+```text
+O(V) for mapping + outDegree + currentRank + nextRank
+O(1) / O(partitions) for IO buffers
+O(E) on disk for binary edge partitions
+```
+
+## Multithreading
+
+PageRankEngine использует `ExecutorService` с числом потоков из `--threads`.
+
+На каждой итерации:
+
+- dangling mass считается параллельно по диапазонам vertex id;
+- edge partitions обрабатываются параллельно;
+- каждая partition-задача потоково читает свой файл `part-xxxxx.bin`;
+- общий `nextRank[]` обновляется без locks, потому что partition `p` содержит только destination-вершины, для которых `floorMod(toInternalId, partitions) == p`.
+
+Это означает, что два worker-потока не пишут вклад в одну и ту же destination-вершину.
+
+## Hyper-Nodes
+
+Гипер-узел со степенью 50 000 не приводит к выделению списка соседей в памяти.
+
+Во время preprocessing его ребра записываются как отдельные бинарные записи:
+
+```text
+int fromInternalId
+int toInternalId
+```
+
+Во время PageRank каждая запись читается последовательно, вклад считается сразу:
+
+```text
+damping * currentRank[from] / outDegree[from]
+```
+
+После этого ребро больше не удерживается в памяти.
+
+## Why Results Are Deterministic
+
+Результаты воспроизводимы при одинаковом входном CSV, параметрах запуска и версии JVM:
+
+- mapping vertex id создается в порядке первого появления id во входном CSV;
+- partition id вычисляется чистой функцией `floorMod(toInternalId, partitions)`;
+- каждое ребро записывается в partition-файл в порядке чтения CSV;
+- каждая destination-вершина обновляется ровно одной partition-задачей;
+- нет `AtomicDouble`, locks или конкурентного сложения в одну ячейку `nextRank`;
+- итоговый CSV сортируется детерминированно: по `vertex ASC` или по `rank DESC`, затем `vertex ASC` для равных rank.
+
+Обычная floating-point погрешность `double` остается, но порядок сложения вкладов для каждой destination-вершины стабилен.
+
+## Limitations
+
+Текущая версия является semi-external memory реализацией:
+
+- ребра `E` находятся на диске и читаются потоково;
+- массивы и mapping по вершинам `V` пока находятся в RAM.
+
+Ограничения:
+
+- `original id -> internal id` mapping строится in-memory;
+- `outDegree`, `currentRank`, `nextRank` хранятся как heap-массивы;
+- `--id-mode contiguous` отклоняет отрицательные vertex id;
+- дубликаты ребер не удаляются и считаются повторными переходами;
+- metadata-файл пока не пишется;
+- partitioning через modulo прост и детерминирован, но может быть хуже для локальности доступа к rank-массивам, чем range partitioning или sorted shards.
+
+Что улучшить для графа, где `V` тоже не помещается в память:
+
+- заменить mapping на external sort / external join;
+- хранить rank и outDegree через memory-mapped files;
+- обрабатывать rank chunks вместо heap-массивов;
+- сортировать partition-файлы по `fromInternalId` для лучшей локальности;
+- добавить metadata/checksum для промежуточных файлов.
+
 ## Цель проекта
 
 Проект реализует аналитическую метрику **PageRank** для большого ориентированного невзвешенного графа, который не помещается в RAM одного узла.
@@ -140,10 +368,10 @@ epsilon = 1e-8
 
 Идея:
 
-- `partitionId = denseTo / verticesPerPartition`;
-- каждая партиция содержит только ребра, ведущие в диапазон destination-вершин;
+- `partitionId = floorMod(denseTo, partitionCount)`;
+- каждая партиция содержит только ребра, ведущие в закрепленный за ней modulo-bucket destination-вершин;
 - на итерации каждый worker обрабатывает одну или несколько destination-партиций;
-- worker пишет только в свой диапазон `nextRank`.
+- worker пишет только в destination-вершины своей партиции.
 
 Плюсы:
 
@@ -151,7 +379,7 @@ epsilon = 1e-8
 - ребра читаются потоково из бинарных партиций;
 - нет больших adjacency list даже для гипер-узлов;
 - разные партиции можно обрабатывать параллельно;
-- запись в `nextRank` не имеет data race, потому что партиции владеют непересекающимися диапазонами destination-вершин.
+- запись в `nextRank` не имеет data race, потому что партиции владеют непересекающимися множествами destination-вершин.
 
 Минусы:
 
@@ -181,18 +409,13 @@ GraphChi-подход делит граф на shard-файлы, каждый и
 
 Основной вариант: **destination-partitioned external-memory PageRank**.
 
-Граф хранится на диске в виде набора бинарных edge-партиций. Каждая партиция содержит ребра, у которых destination-вершина попадает в определенный диапазон dense-id:
+Граф хранится на диске в виде набора бинарных edge-партиций. В текущей реализации каждая партиция содержит ребра, у которых destination-вершина попадает в определенный modulo-bucket:
 
 ```text
-partition 0: to in [0, P)
-partition 1: to in [P, 2P)
-partition 2: to in [2P, 3P)
-...
+partition = floorMod(toInternalId, partitionCount)
 ```
 
-Где `P` — количество destination-вершин в одной партиции.
-
-На каждой итерации worker читает edge-партицию последовательно, вычисляет вклады от source-вершин и аккумулирует значения только для destination-диапазона своей партиции.
+На каждой итерации worker читает edge-партицию последовательно, вычисляет вклады от source-вершин и аккумулирует значения только для destination-вершин своей партиции.
 
 ---
 
@@ -206,7 +429,7 @@ partition 2: to in [2P, 3P)
 
 - текущий rank-вектор;
 - outDegree-массив;
-- локальный буфер `nextRank` для destination-диапазона партиции;
+- локальный буфер или набор блочных записей `nextRank` для destination-вершин партиции;
 - небольшие IO-буферы.
 
 ### Ребра читаются потоково
@@ -227,14 +450,14 @@ to
 
 ### Партиции можно обрабатывать параллельно
 
-Destination-партиции независимы на фазе вычисления `nextRank`, потому что каждая партиция отвечает за свой диапазон destination-вершин.
+Destination-партиции независимы на фазе вычисления `nextRank`, потому что каждая партиция отвечает за свое непересекающееся множество destination-вершин.
 
 Например:
 
 ```text
-worker-1 -> partition 0 -> nextRank[0..P)
-worker-2 -> partition 1 -> nextRank[P..2P)
-worker-3 -> partition 2 -> nextRank[2P..3P)
+worker-1 -> partition 0 -> denseTo % K == 0
+worker-2 -> partition 1 -> denseTo % K == 1
+worker-3 -> partition 2 -> denseTo % K == 2
 ```
 
 ### Запись в nextRank без data race
@@ -458,7 +681,8 @@ from,to
 Правила:
 
 - первая строка может быть header-ом `from,to`;
-- `from` и `to` — signed `int32`;
+- `from` и `to` — `int32`;
+- в режиме `--id-mode contiguous` отрицательные vertex id отклоняются;
 - пробелы вокруг значений допускаются;
 - пустые строки игнорируются;
 - некорректные строки считаются ошибкой preprocessing;
@@ -476,10 +700,10 @@ work/partitions/
 Файлы:
 
 ```text
-part-00000.edges
-part-00001.edges
+part-00000.bin
+part-00001.bin
 ...
-part-00063.edges
+part-00063.bin
 ```
 
 Запись ребра:
@@ -491,13 +715,17 @@ int32 denseTo
 
 Размер записи: `8 bytes`.
 
-Все `denseTo` внутри файла принадлежат destination-диапазону этой партиции.
+Все `denseTo` внутри файла удовлетворяют условию:
+
+```text
+floorMod(denseTo, partitionCount) == partitionId
+```
 
 Файл читается последовательным scan-ом. Порядок ребер внутри партиции не важен для корректности PageRank.
 
 ### Metadata
 
-Файл:
+Файл metadata пока не создается текущей реализацией. На следующем этапе его стоит добавить как:
 
 ```text
 work/metadata.json
@@ -509,32 +737,32 @@ work/metadata.json
 - `edgeCount`;
 - `partitionCount`;
 - `dampingFactor`;
-- `verticesPerPartition`;
-- диапазоны партиций;
+- формулу партиционирования `floorMod(toInternalId, partitionCount)`;
 - checksum входных и промежуточных файлов;
 - статистику степеней.
 
-### Mapping vertex id -> dense id
+### Vertex id file
 
 Файл:
 
 ```text
-work/vertices.map
+work/vertex_ids.bin
 ```
 
-Логический формат:
+Формат:
 
 ```text
-int32 originalVertexId
-int32 denseId
+int32 originalVertexIdByDenseId[0]
+int32 originalVertexIdByDenseId[1]
+...
+int32 originalVertexIdByDenseId[N - 1]
 ```
 
 Используется для:
 
-- преобразования входного CSV в dense-id;
 - экспорта результата обратно в исходные vertex id.
 
-В первой версии mapping может строиться в памяти. Это честное ограничение текущего дизайна, описанное ниже.
+В первой версии mapping `original id -> dense id` строится в памяти, а `vertex_ids.bin` сохраняет обратное отображение.
 
 ### OutDegree-файл
 
@@ -567,17 +795,11 @@ rank[denseFrom] / outDegree[denseFrom]
 
 ### Rank-файлы
 
-Каталог:
-
-```text
-work/ranks/
-```
-
 Файлы:
 
 ```text
-rank-current.bin
-rank-next.bin
+work/current_rank.bin
+work/next_rank.bin
 ```
 
 Формат:
@@ -608,7 +830,7 @@ pagerank.csv
 Формат:
 
 ```text
-vertex_id,pagerank
+vertex,rank
 1,0.123456789
 2,0.234567891
 3,0.641975320
@@ -616,10 +838,11 @@ vertex_id,pagerank
 
 Правила:
 
-- `vertex_id` — исходный `int32` id;
-- `pagerank` — `double`;
+- `vertex` — исходный `int32` id;
+- `rank` — `double`;
 - сумма PageRank по всем вершинам должна быть близка к `1.0`;
-- порядок строк может быть по `denseId` или по убыванию PageRank, в зависимости от CLI-параметра.
+- по умолчанию строки сортируются по `vertex` ASC;
+- если `--sort-by-rank true`, строки сортируются по `rank` DESC.
 
 ---
 
@@ -656,7 +879,7 @@ originalVertexId -> denseId in [0, N)
 
 - `rank[denseId]`;
 - `outDegree[denseId]`;
-- partition ranges.
+- partition buckets.
 
 В первой версии mapping может строиться в памяти через hash map. Для графов, где число вершин само не помещается в memory budget, это нужно заменить на external sort.
 
@@ -684,24 +907,24 @@ CSV читается еще раз.
 ```text
 denseFrom = mapping[from]
 denseTo = mapping[to]
-partitionId = denseTo / verticesPerPartition
+partitionId = floorMod(denseTo, partitionCount)
 ```
 
 Ребро записывается в бинарный файл:
 
 ```text
-work/partitions/part-{partitionId}.edges
+work/partitions/part-{partitionId}.bin
 ```
 
-Чтобы не держать много данных в памяти, запись выполняется через небольшие buffered writers. Если количество партиций велико, используется ограниченный пул открытых файлов с LRU-политикой.
+Чтобы не держать ребра в памяти, запись выполняется через `BufferedOutputStream` / `DataOutputStream`. Текущая версия создает все partition-файлы заранее, включая пустые.
 
 ### Шаг 5. Инициализация rank-файлов
 
 Создаются rank-файлы:
 
 ```text
-rank-current.bin
-rank-next.bin
+current_rank.bin
+next_rank.bin
 ```
 
 Начальное значение для каждой вершины:
@@ -717,7 +940,7 @@ rank-next.bin
 - количество вершин;
 - количество ребер;
 - количество партиций;
-- размер partition range;
+- формула partition bucket;
 - статистика степеней;
 - настройки запуска;
 - checksum промежуточных файлов.
@@ -759,7 +982,7 @@ base = (1 - damping) / N + damping * danglingMass / N
 Каждая задача `PartitionRankTask` получает:
 
 - descriptor партиции;
-- диапазон destination-вершин `[startDenseId, endDenseId)`;
+- множество destination-вершин, принадлежащих partition bucket;
 - доступ к `currentRank`;
 - доступ к `outDegree`;
 - `base`;
@@ -768,7 +991,7 @@ base = (1 - damping) / N + damping * danglingMass / N
 
 Алгоритм для партиции:
 
-1. Создать локальный массив `localNext` размером с диапазон destination-вершин.
+1. Создать локальный accumulator для destination-вершин этой партиции.
 2. Заполнить `localNext` значением `base`.
 3. Последовательно прочитать все ребра `denseFrom,denseTo` из файла партиции.
 4. Если `outDegree[denseFrom] > 0`, добавить вклад:
@@ -778,7 +1001,7 @@ localIndex = denseTo - partitionStart
 localNext[localIndex] += damping * currentRank[denseFrom] / outDegree[denseFrom]
 ```
 
-5. Записать `localNext` в соответствующий диапазон `rank-next.bin`.
+5. Записать значения в соответствующие позиции `next_rank.bin`.
 6. Посчитать локальную L1 delta относительно `currentRank` для этого диапазона.
 7. Вернуть `RankStats` в главный поток.
 
@@ -804,7 +1027,7 @@ L1 delta < epsilon
 
 Иначе:
 
-- `rank-next.bin` становится `rank-current.bin`;
+- `next_rank.bin` становится `current_rank.bin`;
 - начинается следующая итерация.
 
 Физически swap можно сделать переименованием файлов или swap-ом ссылок на файлы.
@@ -966,7 +1189,7 @@ Preprocessing:
 ```text
 currentRank: 8 * N bytes, если хранится в heap
 outDegree:   4 * N bytes, если хранится в heap
-localNext:   8 * verticesPerPartition * activeTasks
+partition accumulator: depends on partition bucket size and implementation
 IO buffers:  O(K или activeFiles)
 metadata:    O(K)
 mapping:     зависит от реализации

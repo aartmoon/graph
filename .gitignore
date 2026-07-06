@@ -1,0 +1,17 @@
+.gradle/
+build/
+out/
+target/
+
+work/
+output/
+data/generated/
+
+*.log
+*.tmp
+*.class
+
+.idea/
+*.iml
+
+.DS_Store
