@@ -13,6 +13,7 @@ import org.example.largegraph.util.MemoryUtils;
 import org.example.largegraph.util.ProgressLogger;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -194,49 +195,59 @@ public final class PageRankEngine {
             ExecutorService executor
     ) throws IOException {
         Map<Integer, List<MessageFile>> messageIndex = buildDestinationMessageIndex(iterationMessagesDir);
+        fillRankNextWithBase(graph, base);
+
+        List<Callable<GatherStats>> tasks = new ArrayList<>(messageIndex.size());
+        for (int destinationPartition : touchedDestinationPartitionsByDescendingMessageBytes(messageIndex)) {
+            List<MessageFile> messageFiles = messageIndex.get(destinationPartition);
+            tasks.add(() -> gatherPartition(graph, destinationPartition, messageFiles));
+        }
+        List<GatherStats> stats = invokeAll(executor, tasks);
+        long messages = 0;
+        for (GatherStats stat : stats) {
+            messages += stat.messageCount();
+        }
+        logger.info("gather messages=%d tasks=%d".formatted(messages, tasks.size()));
+    }
+
+    private void fillRankNextWithBase(PreprocessingResult graph, double base) throws IOException {
         try (DiskDoubleArray nextRanks = new DiskDoubleArray(graph.rankNextPath(), graph.vertexCount(), graph.chunkSize())) {
-            List<Callable<GatherStats>> tasks = new ArrayList<>(graph.destinationPartitionCount());
-            for (int destinationPartition : destinationPartitionsByDescendingMessageBytes(graph, messageIndex)) {
-                List<MessageFile> messageFiles = messageIndex.getOrDefault(destinationPartition, List.of());
-                tasks.add(() -> gatherPartition(graph, base, nextRanks, destinationPartition, messageFiles));
+            int maxChunkLength = Math.toIntExact(Math.min((long) graph.chunkSize(), Math.max(1L, graph.vertexCount())));
+            double[] nextChunk = new double[maxChunkLength];
+            ByteBuffer scratch = ByteBuffer.allocate(nextChunk.length * Double.BYTES);
+            for (long start = 0; start < graph.vertexCount(); start += graph.chunkSize()) {
+                int length = chunkLength(graph, start);
+                java.util.Arrays.fill(nextChunk, 0, length, base);
+                nextRanks.writeChunk(start, nextChunk, length, scratch);
             }
-            List<GatherStats> stats = invokeAll(executor, tasks);
             nextRanks.flush();
-            long messages = 0;
-            for (GatherStats stat : stats) {
-                messages += stat.messageCount();
-            }
-            logger.info("gather messages=%d tasks=%d".formatted(messages, tasks.size()));
         }
     }
 
     private GatherStats gatherPartition(
             PreprocessingResult graph,
-            double base,
-            DiskDoubleArray nextRanks,
             int destinationPartition,
             List<MessageFile> messageFiles
     ) throws IOException {
         long destinationStart = (long) destinationPartition * graph.chunkSize();
         int destinationLength = chunkLength(graph, destinationStart);
-        double[] nextChunk = new double[destinationLength];
         long messageCount = 0;
+        ByteBuffer scratch = ByteBuffer.allocate(destinationLength * Double.BYTES);
 
-        for (MessageFile messageFile : messageFiles) {
-            try (BinaryMessageReader reader = new BinaryMessageReader(messageFile.path())) {
-                Optional<Message> message;
-                while ((message = reader.next()).isPresent()) {
-                    int localTo = Math.toIntExact(message.get().to() - destinationStart);
-                    nextChunk[localTo] += message.get().contribution();
-                    messageCount++;
+        try (DiskDoubleArray nextRanks = new DiskDoubleArray(graph.rankNextPath(), graph.vertexCount(), graph.chunkSize())) {
+            double[] nextChunk = nextRanks.readChunk(destinationStart, destinationLength, scratch);
+            for (MessageFile messageFile : messageFiles) {
+                try (BinaryMessageReader reader = new BinaryMessageReader(messageFile.path())) {
+                    Optional<Message> message;
+                    while ((message = reader.next()).isPresent()) {
+                        int localTo = Math.toIntExact(message.get().to() - destinationStart);
+                        nextChunk[localTo] += message.get().contribution();
+                        messageCount++;
+                    }
                 }
             }
+            nextRanks.writeChunk(destinationStart, nextChunk, destinationLength, scratch);
         }
-
-        for (int i = 0; i < destinationLength; i++) {
-            nextChunk[i] += base;
-        }
-        nextRanks.writeChunk(destinationStart, nextChunk, destinationLength);
         return new GatherStats(messageCount);
     }
 
@@ -286,17 +297,11 @@ public final class PageRankEngine {
         }
     }
 
-    private List<Integer> destinationPartitionsByDescendingMessageBytes(
-            PreprocessingResult graph,
-            Map<Integer, List<MessageFile>> messageIndex
-    ) {
-        List<Integer> partitions = new ArrayList<>(graph.destinationPartitionCount());
-        for (int partition = 0; partition < graph.destinationPartitionCount(); partition++) {
-            partitions.add(partition);
-        }
+    private List<Integer> touchedDestinationPartitionsByDescendingMessageBytes(Map<Integer, List<MessageFile>> messageIndex) {
+        List<Integer> partitions = new ArrayList<>(messageIndex.keySet());
         partitions.sort(Comparator
                 .comparingLong((Integer partition) -> messageIndex
-                        .getOrDefault(partition, List.of())
+                        .get(partition)
                         .stream()
                         .mapToLong(MessageFile::bytes)
                         .sum())

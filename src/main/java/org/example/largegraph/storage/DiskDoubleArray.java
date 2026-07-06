@@ -36,8 +36,15 @@ public final class DiskDoubleArray implements Closeable {
 
     public double[] readChunk(long startId, int requestedLength) throws IOException {
         validateRange(startId, requestedLength);
-        double[] values = new double[requestedLength];
         ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
+        return readChunk(startId, requestedLength, buffer);
+    }
+
+    public double[] readChunk(long startId, int requestedLength, ByteBuffer scratch) throws IOException {
+        validateRange(startId, requestedLength);
+        ensureScratchCapacity(scratch, requestedLength);
+        double[] values = new double[requestedLength];
+        ByteBuffer buffer = prepareScratch(scratch, requestedLength);
         readFully(buffer, startId * BYTES);
         buffer.flip();
         for (int i = 0; i < requestedLength; i++) {
@@ -53,6 +60,17 @@ public final class DiskDoubleArray implements Closeable {
             throw new IllegalArgumentException("values array is shorter than requested length");
         }
         ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
+        writeChunk(startId, values, requestedLength, buffer);
+    }
+
+    public void writeChunk(long startId, double[] values, int requestedLength, ByteBuffer scratch) throws IOException {
+        ensureWritable();
+        validateRange(startId, requestedLength);
+        if (values.length < requestedLength) {
+            throw new IllegalArgumentException("values array is shorter than requested length");
+        }
+        ensureScratchCapacity(scratch, requestedLength);
+        ByteBuffer buffer = prepareScratch(scratch, requestedLength);
         for (int i = 0; i < requestedLength; i++) {
             buffer.putDouble(values[i]);
         }
@@ -64,10 +82,11 @@ public final class DiskDoubleArray implements Closeable {
         ensureWritable();
         channel.truncate(length * BYTES);
         double[] chunk = new double[(int) Math.min(chunkSize, Math.max(1L, length))];
+        ByteBuffer scratch = ByteBuffer.allocate(chunk.length * BYTES);
         java.util.Arrays.fill(chunk, value);
         for (long start = 0; start < length; start += chunkSize) {
             int len = chunkLength(start);
-            writeChunk(start, chunk, len);
+            writeChunk(start, chunk, len, scratch);
         }
         flush();
     }
@@ -101,6 +120,20 @@ public final class DiskDoubleArray implements Closeable {
         if (!writable) {
             throw new IllegalStateException("disk array is opened read-only: " + path);
         }
+    }
+
+    private void ensureScratchCapacity(ByteBuffer scratch, int requestedLength) {
+        int requiredBytes = requestedLength * BYTES;
+        if (scratch.capacity() < requiredBytes) {
+            throw new IllegalArgumentException("scratch buffer is too small: required=%d capacity=%d"
+                    .formatted(requiredBytes, scratch.capacity()));
+        }
+    }
+
+    private ByteBuffer prepareScratch(ByteBuffer scratch, int requestedLength) {
+        scratch.clear();
+        scratch.limit(requestedLength * BYTES);
+        return scratch;
     }
 
     private void readFully(ByteBuffer buffer, long position) throws IOException {

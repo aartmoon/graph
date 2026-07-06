@@ -14,6 +14,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 
 public final class Main {
+    private static final int MAX_INT_SORT_CHUNK = 500_000;
+    private static final int MAX_RECORD_SORT_CHUNK = 250_000;
+
     private Main() {
     }
 
@@ -48,16 +51,24 @@ public final class Main {
 
     private static void warnIfChunkSizeLooksRisky(AppConfig config, ProgressLogger logger) {
         long activeTasks = Math.max(1, config.threads());
-        long estimatedChunkBytes = safeMultiply(config.chunkSize(), 64L);
-        long estimatedConcurrentBytes = safeMultiply(estimatedChunkBytes, activeTasks);
+        long pagerankChunkEstimate = safeMultiply(safeMultiply(config.chunkSize(), 64L), activeTasks);
+        long intSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK), Integer.BYTES);
+        long recordSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_RECORD_SORT_CHUNK), 32L);
         long maxHeap = MemoryUtils.maxHeapBytes();
-        if (estimatedConcurrentBytes > maxHeap / 2) {
-            logger.info("WARNING chunk-size may be too large for heap: chunkSize=%d threads=%d estimatedChunkHeap=%s maxHeap=%s"
+        long largestEstimate = Math.max(pagerankChunkEstimate, Math.max(intSortChunkEstimate, recordSortChunkEstimate));
+        if (largestEstimate > maxHeap / 2) {
+            logger.info("""
+                    WARNING memory configuration may be risky:
+                      maxHeap=%s
+                      pagerankChunkEstimate=%s
+                      intSortChunkEstimate=%s
+                      recordSortChunkEstimate=%s
+                      consider --chunk-size 10000..100000 for -Xmx128m"""
                     .formatted(
-                            config.chunkSize(),
-                            config.threads(),
-                            MemoryUtils.humanReadableBytes(estimatedConcurrentBytes),
-                            MemoryUtils.humanReadableBytes(maxHeap)
+                            MemoryUtils.humanReadableBytes(maxHeap),
+                            MemoryUtils.humanReadableBytes(pagerankChunkEstimate),
+                            MemoryUtils.humanReadableBytes(intSortChunkEstimate),
+                            MemoryUtils.humanReadableBytes(recordSortChunkEstimate)
                     ));
         }
     }

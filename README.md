@@ -180,8 +180,10 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 
 - каждый worker пишет `manifest.txt` со списком только реально созданных destination partitions;
 - gather строит index из manifest-файлов;
-- destination partitions сортируются по суммарным message bytes по убыванию;
-- task выделяет только `nextChunk` для своего destination chunk;
+- `rank_next.bin` сначала sequentially заполняется base value для всех partitions;
+- task создается только для destination partitions, реально присутствующих в manifest index;
+- touched destination partitions сортируются по суммарным message bytes по убыванию;
+- task открывает свой `DiskDoubleArray` для `rank_next.bin` и выделяет только `nextChunk` для своего destination chunk;
 - `Files.exists` для всех `workers * partitions` не выполняется.
 
 Фаза 3, convergence:
@@ -231,6 +233,15 @@ O(chunkSize * activeTasks)
 ```
 
 Для большего heap `chunk-size` можно увеличивать. При явно рискованной комбинации `chunk-size`, `threads` и `Runtime.maxMemory()` приложение пишет conservative warning, но не останавливает запуск.
+
+External sort chunks имеют internal caps отдельно от PageRank `chunk-size`:
+
+```text
+int sort chunk <= 500000 ids
+endpoint record sort chunk <= 250000 records
+```
+
+Runtime warning остается advisory и отдельно показывает `pagerankChunkEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate` и `maxHeap`; это не полноценный memory planner.
 
 В heap не хранятся:
 
@@ -359,11 +370,12 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 ## Ограничения
 
 - external sort implementation простой: chunk sort + k-way merge;
+- hot-path sort для endpoint refs/assignments использует primitive arrays, generic record sorter оставлен как fallback;
 - preprocessing делает несколько disk passes;
-- messages занимают `O(E)` временного места на каждой итерации;
+- messages занимают `O(E)` временного места на каждой итерации: на каждое ребро пишется record `int denseTo,double contribution` при наличии исходящей степени;
 - число unique observed vertices должно помещаться в `int denseId`;
 - `partitionCount = ceil(V / chunkSize)` должен помещаться в `int`;
 - preprocessing может требовать несколько размеров исходного edge storage во временном диске;
 - compression/checkpoint/resume пока нет;
-- `DiskDoubleArray` и `DiskIntArray` используют synchronized positional writes для корректности, что может ограничивать write parallelism gather;
+- `DiskDoubleArray` и `DiskIntArray` используют synchronized positional writes внутри одного handle; parallel gather открывает independent handles для непересекающихся destination ranges;
 - один сверхтяжелый source partition пока не дробится внутри partition.

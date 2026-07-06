@@ -41,8 +41,15 @@ public final class DiskIntArray implements Closeable {
 
     public int[] readIntChunk(long startId, int requestedLength) throws IOException {
         validateRange(startId, requestedLength);
-        int[] values = new int[requestedLength];
         ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
+        return readIntChunk(startId, requestedLength, buffer);
+    }
+
+    public int[] readIntChunk(long startId, int requestedLength, ByteBuffer scratch) throws IOException {
+        validateRange(startId, requestedLength);
+        ensureScratchCapacity(scratch, requestedLength);
+        int[] values = new int[requestedLength];
+        ByteBuffer buffer = prepareScratch(scratch, requestedLength);
         readFully(buffer, startId * BYTES);
         buffer.flip();
         for (int i = 0; i < requestedLength; i++) {
@@ -58,6 +65,17 @@ public final class DiskIntArray implements Closeable {
             throw new IllegalArgumentException("values array is shorter than requested length");
         }
         ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
+        writeIntChunk(startId, values, requestedLength, buffer);
+    }
+
+    public void writeIntChunk(long startId, int[] values, int requestedLength, ByteBuffer scratch) throws IOException {
+        ensureWritable();
+        validateRange(startId, requestedLength);
+        if (values.length < requestedLength) {
+            throw new IllegalArgumentException("values array is shorter than requested length");
+        }
+        ensureScratchCapacity(scratch, requestedLength);
+        ByteBuffer buffer = prepareScratch(scratch, requestedLength);
         for (int i = 0; i < requestedLength; i++) {
             buffer.putInt(values[i]);
         }
@@ -70,10 +88,11 @@ public final class DiskIntArray implements Closeable {
         flushCachedChunk();
         channel.truncate(length * BYTES);
         int[] chunk = new int[(int) Math.min(chunkSize, Math.max(1L, length))];
+        ByteBuffer scratch = ByteBuffer.allocate(chunk.length * BYTES);
         java.util.Arrays.fill(chunk, value);
         for (long start = 0; start < length; start += chunkSize) {
             int len = chunkLength(start);
-            writeIntChunk(start, chunk, len);
+            writeIntChunk(start, chunk, len, scratch);
         }
         flush();
     }
@@ -142,6 +161,20 @@ public final class DiskIntArray implements Closeable {
         if (!writable) {
             throw new IllegalStateException("disk array is opened read-only: " + path);
         }
+    }
+
+    private void ensureScratchCapacity(ByteBuffer scratch, int requestedLength) {
+        int requiredBytes = requestedLength * BYTES;
+        if (scratch.capacity() < requiredBytes) {
+            throw new IllegalArgumentException("scratch buffer is too small: required=%d capacity=%d"
+                    .formatted(requiredBytes, scratch.capacity()));
+        }
+    }
+
+    private ByteBuffer prepareScratch(ByteBuffer scratch, int requestedLength) {
+        scratch.clear();
+        scratch.limit(requestedLength * BYTES);
+        return scratch;
     }
 
     private void readFully(ByteBuffer buffer, long position) throws IOException {

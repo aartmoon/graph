@@ -26,6 +26,7 @@ import java.util.Properties;
 
 public final class GraphPreprocessor {
     private static final long PROGRESS_INTERVAL_EDGES = 1_000_000L;
+    private static final int MAX_INT_SORT_CHUNK = 500_000;
     private static final int MAX_RECORD_SORT_CHUNK = 250_000;
 
     private final AppConfig config;
@@ -107,7 +108,7 @@ public final class GraphPreprocessor {
 
     private ExternalIntSorter.SortUniqueResult sortVertices() throws IOException {
         logger.info("Sorting and deduplicating observed vertex ids");
-        ExternalIntSorter sorter = new ExternalIntSorter(config.chunkSize());
+        ExternalIntSorter sorter = new ExternalIntSorter(intSortChunkSize());
         ExternalIntSorter.SortUniqueResult result = sorter.sortUniqueToVerticesAndMapping(
                 vertexIdsUnsortedPath(),
                 verticesPath(),
@@ -126,14 +127,7 @@ public final class GraphPreprocessor {
         writeEndpointReferences();
 
         logger.info("Sorting endpoint references by original id");
-        new ExternalRecordSorter<>(
-                EndpointRefReader::new,
-                EndpointRefWriter::new,
-                Comparator.comparingInt(EndpointRef::originalId)
-                        .thenComparingLong(EndpointRef::edgeId)
-                        .thenComparingInt(record -> record.side()),
-                recordSortChunkSize()
-        ).sort(
+        new EndpointRefExternalSorter(recordSortChunkSize()).sort(
                 endpointRefsPath(),
                 endpointRefsSortedPath(),
                 config.workDir().resolve("sort").resolve("endpoint-refs"),
@@ -144,13 +138,7 @@ public final class GraphPreprocessor {
         mergeJoinEndpointAssignments();
 
         logger.info("Sorting endpoint assignments by edge id");
-        new ExternalRecordSorter<>(
-                EndpointAssignmentReader::new,
-                EndpointAssignmentWriter::new,
-                Comparator.comparingLong(EndpointAssignment::edgeId)
-                        .thenComparingInt(record -> record.side()),
-                recordSortChunkSize()
-        ).sort(
+        new EndpointAssignmentExternalSorter(recordSortChunkSize()).sort(
                 endpointAssignmentsPath(),
                 endpointAssignmentsSortedPath(),
                 config.workDir().resolve("sort").resolve("endpoint-assignments"),
@@ -283,6 +271,10 @@ public final class GraphPreprocessor {
 
     private int recordSortChunkSize() {
         return Math.min(config.chunkSize(), MAX_RECORD_SORT_CHUNK);
+    }
+
+    private int intSortChunkSize() {
+        return Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK);
     }
 
     private void validateVertexId(int vertexId) {
