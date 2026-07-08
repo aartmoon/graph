@@ -51,9 +51,12 @@ public final class Main {
 
     private static void warnIfChunkSizeLooksRisky(AppConfig config, ProgressLogger logger) {
         long activeTasks = Math.max(1, config.threads());
-        long pagerankChunkEstimate = safeMultiply(safeMultiply(config.chunkSize(), 64L), activeTasks);
+        long scatterEstimate = safeMultiply(
+                safeMultiply(config.chunkSize(), (long) Double.BYTES + Integer.BYTES),
+                activeTasks
+        );
         long gatherCacheEstimate = safeMultiply(
-                safeMultiply(config.chunkSize(), (long) Double.BYTES),
+                safeMultiply(config.chunkSize(), (long) Double.BYTES * 2L),
                 safeMultiply(config.gatherChunkCacheSize(), activeTasks)
         );
         long intSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK), Integer.BYTES);
@@ -61,14 +64,14 @@ public final class Main {
         long topKEstimate = safeMultiply(config.topK(), 32L);
         long maxHeap = MemoryUtils.maxHeapBytes();
         long largestEstimate = Math.max(
-                Math.max(Math.max(pagerankChunkEstimate, gatherCacheEstimate), topKEstimate),
+                Math.max(Math.max(scatterEstimate, gatherCacheEstimate), topKEstimate),
                 Math.max(intSortChunkEstimate, recordSortChunkEstimate)
         );
         if (largestEstimate > maxHeap / 2) {
             logger.info("""
                     WARNING memory configuration may be risky:
                       maxHeap=%s
-                      pagerankChunkEstimate=%s
+                      scatterEstimate=%s
                       gatherCacheEstimate=%s
                       intSortChunkEstimate=%s
                       recordSortChunkEstimate=%s
@@ -76,7 +79,7 @@ public final class Main {
                       consider --chunk-size 10000..100000 for -Xmx128m"""
                     .formatted(
                             MemoryUtils.humanReadableBytes(maxHeap),
-                            MemoryUtils.humanReadableBytes(pagerankChunkEstimate),
+                            MemoryUtils.humanReadableBytes(scatterEstimate),
                             MemoryUtils.humanReadableBytes(gatherCacheEstimate),
                             MemoryUtils.humanReadableBytes(intSortChunkEstimate),
                             MemoryUtils.humanReadableBytes(recordSortChunkEstimate),

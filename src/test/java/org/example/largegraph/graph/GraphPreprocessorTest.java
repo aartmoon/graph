@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -39,11 +40,20 @@ final class GraphPreprocessorTest {
         assertEquals(1, result.sourcePartitionCount());
         assertTrue(Files.exists(workDir.resolve("meta.properties")));
         assertTrue(Files.exists(workDir.resolve("vertices.bin")));
-        assertTrue(Files.exists(workDir.resolve("mapping.bin")));
         assertTrue(Files.exists(workDir.resolve("vertex").resolve("out_degree.bin")));
         assertTrue(Files.exists(workDir.resolve("vertex").resolve("rank_current.bin")));
         assertTrue(Files.exists(workDir.resolve("vertex").resolve("rank_next.bin")));
         assertTrue(Files.exists(workDir.resolve("edges_by_source").resolve("src-part-00000.bin")));
+        assertFalse(Files.exists(workDir.resolve("raw_edges.bin")));
+        assertFalse(Files.exists(workDir.resolve("vertex_ids_unsorted.bin")));
+        assertFalse(Files.exists(workDir.resolve("mapping.bin")));
+        assertFalse(Files.exists(workDir.resolve("endpoint_refs.bin")));
+        assertFalse(Files.exists(workDir.resolve("endpoint_refs.sorted.bin")));
+        assertFalse(Files.exists(workDir.resolve("endpoint_assignments.bin")));
+        assertFalse(Files.exists(workDir.resolve("endpoint_assignments.sorted.bin")));
+        assertFalse(Files.exists(workDir.resolve("dense_edges.bin")));
+        assertFalse(Files.exists(workDir.resolve("dense_edges.sorted.bin")));
+        assertFalse(Files.exists(workDir.resolve("sort")));
 
         try (DiskIntArray outDegree = new DiskIntArray(result.outDegreePath(), result.vertexCount(), result.chunkSize())) {
             assertEquals(2, outDegree.getInt(0));
@@ -54,6 +64,29 @@ final class GraphPreprocessorTest {
             assertEquals(10, vertices.getInt(0));
             assertEquals(20, vertices.getInt(1));
             assertEquals(30, vertices.getInt(2));
+        }
+    }
+
+    @Test
+    void duplicateEdgesAreDeduplicatedForUnweightedGraph() throws IOException {
+        Path input = tempDir.resolve("duplicates.csv");
+        Path output = tempDir.resolve("output").resolve("pagerank.csv");
+        Path workDir = tempDir.resolve("duplicates-work");
+        Files.writeString(input, """
+                from,to
+                1,2
+                1,2
+                1,3
+                """);
+
+        AppConfig config = config(input, output, workDir, 4, 2);
+        GraphPreprocessor.PreprocessingResult result = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
+
+        assertEquals(2, result.edgeCount());
+        try (DiskIntArray outDegree = new DiskIntArray(result.outDegreePath(), result.vertexCount(), result.chunkSize())) {
+            assertEquals(2, outDegree.getInt(0));
+            assertEquals(0, outDegree.getInt(1));
+            assertEquals(0, outDegree.getInt(2));
         }
     }
 
@@ -129,9 +162,10 @@ final class GraphPreprocessorTest {
                 0.85,
                 30,
                 1e-8,
-                AppConfig.IdMode.CONTIGUOUS,
+                AppConfig.IdMode.EXTERNAL_DENSE,
                 0,
                 8,
+                16L * 1024L * 1024L,
                 false
         );
     }

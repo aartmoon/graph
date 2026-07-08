@@ -38,8 +38,8 @@ import java.util.concurrent.TimeUnit;
 public final class PageRankEngine {
     private static final double RANK_SUM_WARNING_THRESHOLD = 1e-6;
     private static final int EDGE_RECORD_BYTES = Integer.BYTES * 2;
-    private static final long MAX_SCATTER_SLICE_BYTES = 1024L * 1024L;
     private static final int EDGE_READ_BUFFER_BYTES = 64 * 1024;
+    private static final int MAX_TOTAL_MESSAGE_WRITERS = 256;
 
     private final AppConfig config;
     private final ProgressLogger logger;
@@ -89,6 +89,7 @@ public final class PageRankEngine {
                             graph.rankCurrentPath(),
                             graph.verticesPath(),
                             graph.vertexCount(),
+                            graph.edgeCount(),
                             completedIterations,
                             lastDiff,
                             lastRankSum,
@@ -101,6 +102,7 @@ public final class PageRankEngine {
                     graph.rankCurrentPath(),
                     graph.verticesPath(),
                     graph.vertexCount(),
+                    graph.edgeCount(),
                     completedIterations,
                     lastDiff,
                     lastRankSum,
@@ -157,85 +159,96 @@ public final class PageRankEngine {
         long edgeCount = 0;
         long messageCount = 0;
         Path workerDir = iterationMessagesDir.resolve("worker-%05d".formatted(work.workerId()));
-        int maxOpenMessageWriters = Math.min(64, Math.max(4, config.threads() * 4));
+        int maxOpenMessageWriters = maxOpenMessageWritersPerWorker();
 
         try (DiskDoubleArray ranks = new DiskDoubleArray(graph.rankCurrentPath(), graph.vertexCount(), graph.chunkSize(), false);
              DiskIntArray outDegree = new DiskIntArray(graph.outDegreePath(), graph.vertexCount(), graph.chunkSize(), false);
              MessagePartitionWriterManager messageWriters =
                      new MessagePartitionWriterManager(workerDir, graph.destinationPartitionCount(), maxOpenMessageWriters)) {
-            int cachedSourcePartition = -1;
-            long cachedSourceStart = -1;
-            double[] cachedRankChunk = null;
-            int[] cachedOutDegreeChunk = null;
-            for (SourcePartitionSlice slice : work.slices()) {
-                int sourcePartition = slice.partition();
-                if (sourcePartition != cachedSourcePartition) {
-                    cachedSourcePartition = sourcePartition;
-                    cachedSourceStart = (long) sourcePartition * graph.chunkSize();
-                    int sourceLength = chunkLength(graph, cachedSourceStart);
-                    cachedRankChunk = ranks.readChunk(cachedSourceStart, sourceLength);
-                    cachedOutDegreeChunk = outDegree.readIntChunk(cachedSourceStart, sourceLength);
-                }
+            Map<Integer, List<SourcePartitionSlice>> slicesByPartition = slicesBySourcePartition(work.slices());
+            for (Map.Entry<Integer, List<SourcePartitionSlice>> entry : slicesByPartition.entrySet()) {
+                int sourcePartition = entry.getKey();
+                long sourceStart = (long) sourcePartition * graph.chunkSize();
+                int sourceLength = chunkLength(graph, sourceStart);
+                double[] rankChunk = ranks.readChunk(sourceStart, sourceLength);
+                int[] outDegreeChunk = outDegree.readIntChunk(sourceStart, sourceLength);
                 Path sourcePartitionPath = graph.edgesDir()
                         .resolve("src-part-%05d.bin".formatted(sourcePartition));
                 if (!Files.exists(sourcePartitionPath)) {
                     continue;
                 }
 
-                ScatterStats sliceStats = scatterSourcePartitionSlice(
-                        graph,
-                        messageWriters,
-                        sourcePartitionPath,
-                        slice,
-                        cachedSourceStart,
-                        cachedRankChunk,
-                        cachedOutDegreeChunk
-                );
-                edgeCount += sliceStats.edgeCount();
-                messageCount += sliceStats.messageCount();
+                try (FileChannel channel = FileChannel.open(sourcePartitionPath, StandardOpenOption.READ)) {
+                    ByteBuffer buffer = ByteBuffer.allocate(EDGE_READ_BUFFER_BYTES);
+                    for (SourcePartitionSlice slice : entry.getValue()) {
+                        ScatterStats sliceStats = scatterSourcePartitionSlice(
+                                graph,
+                                messageWriters,
+                                channel,
+                                slice,
+                                sourceStart,
+                                rankChunk,
+                                outDegreeChunk,
+                                buffer
+                        );
+                        edgeCount += sliceStats.edgeCount();
+                        messageCount += sliceStats.messageCount();
+                    }
+                }
             }
         }
         long messageBytes = messageBytesFromManifest(workerDir);
         return new ScatterStats(edgeCount, messageCount, messageBytes);
     }
 
+    private int maxOpenMessageWritersPerWorker() {
+        int totalBudget = Math.max(config.threads(), Math.min(MAX_TOTAL_MESSAGE_WRITERS, config.threads() * 8));
+        return Math.max(1, totalBudget / config.threads());
+    }
+
+    private Map<Integer, List<SourcePartitionSlice>> slicesBySourcePartition(List<SourcePartitionSlice> slices) {
+        Map<Integer, List<SourcePartitionSlice>> grouped = new LinkedHashMap<>();
+        for (SourcePartitionSlice slice : slices) {
+            grouped.computeIfAbsent(slice.partition(), ignored -> new ArrayList<>()).add(slice);
+        }
+        return grouped;
+    }
+
     private ScatterStats scatterSourcePartitionSlice(
             PreprocessingResult graph,
             MessagePartitionWriterManager messageWriters,
-            Path sourcePartitionPath,
+            FileChannel channel,
             SourcePartitionSlice slice,
             long sourceStart,
             double[] rankChunk,
-            int[] outDegreeChunk
+            int[] outDegreeChunk,
+            ByteBuffer buffer
     ) throws IOException {
         long edgeCount = 0;
         long messageCount = 0;
-        ByteBuffer buffer = ByteBuffer.allocate((int) Math.min(EDGE_READ_BUFFER_BYTES, Math.max(EDGE_RECORD_BYTES, slice.bytes())));
 
-        try (FileChannel channel = FileChannel.open(sourcePartitionPath, StandardOpenOption.READ)) {
-            long position = slice.startByte();
-            long end = slice.startByte() + slice.bytes();
-            while (position < end) {
-                int bytesToRead = Math.toIntExact(Math.min(buffer.capacity(), end - position));
-                buffer.clear();
-                buffer.limit(bytesToRead);
-                readFully(channel, buffer, position);
-                position += bytesToRead;
-                buffer.flip();
+        long position = slice.startByte();
+        long end = slice.startByte() + slice.bytes();
+        while (position < end) {
+            int bytesToRead = Math.toIntExact(Math.min(buffer.capacity(), end - position));
+            buffer.clear();
+            buffer.limit(bytesToRead);
+            readFully(channel, buffer, position);
+            position += bytesToRead;
+            buffer.flip();
 
-                while (buffer.hasRemaining()) {
-                    int from = buffer.getInt();
-                    int to = buffer.getInt();
-                    int localFrom = Math.toIntExact(from - sourceStart);
-                    int degree = outDegreeChunk[localFrom];
-                    if (degree > 0) {
-                        double contribution = config.damping() * rankChunk[localFrom] / degree;
-                        int destinationPartition = to / graph.chunkSize();
-                        messageWriters.write(destinationPartition, to, contribution);
-                        messageCount++;
-                    }
-                    edgeCount++;
+            while (buffer.hasRemaining()) {
+                int from = buffer.getInt();
+                int to = buffer.getInt();
+                int localFrom = Math.toIntExact(from - sourceStart);
+                int degree = outDegreeChunk[localFrom];
+                if (degree > 0) {
+                    double contribution = config.damping() * rankChunk[localFrom] / degree;
+                    int destinationPartition = to / graph.chunkSize();
+                    messageWriters.write(destinationPartition, to, contribution);
+                    messageCount++;
                 }
+                edgeCount++;
             }
         }
         return new ScatterStats(edgeCount, messageCount, 0);
@@ -275,7 +288,7 @@ public final class PageRankEngine {
         int firstPartition = bucketLayout.firstPartition(bucket);
         int endPartitionExclusive = bucketLayout.endPartitionExclusive(bucket);
 
-        try (DiskDoubleArray nextRanks = new DiskDoubleArray(graph.rankNextPath(), graph.vertexCount(), graph.chunkSize())) {
+        try (DiskDoubleArray nextRanks = new DiskDoubleArray(graph.rankNextPath(), graph.vertexCount(), graph.chunkSize(), true, false)) {
             GatherChunkCache chunkCache = new GatherChunkCache(graph, nextRanks, base, config.gatherChunkCacheSize());
             for (MessageFile messageFile : messageFiles) {
                 try (BinaryMessageReader reader = new BinaryMessageReader(messageFile.path())) {
@@ -365,7 +378,7 @@ public final class PageRankEngine {
         long startByte = 0;
         while (startByte < bytes) {
             long remaining = bytes - startByte;
-            long sliceBytes = Math.min(remaining, MAX_SCATTER_SLICE_BYTES);
+            long sliceBytes = Math.min(remaining, config.scatterSliceBytes());
             sliceBytes -= sliceBytes % EDGE_RECORD_BYTES;
             if (sliceBytes == 0) {
                 sliceBytes = EDGE_RECORD_BYTES;
@@ -685,6 +698,7 @@ public final class PageRankEngine {
             Path rankPath,
             Path verticesPath,
             long vertexCount,
+            long edgeCount,
             int iterations,
             double lastDelta,
             double rankSum,

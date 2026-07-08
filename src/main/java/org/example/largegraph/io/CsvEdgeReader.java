@@ -6,18 +6,19 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Optional;
 
 public final class CsvEdgeReader implements Closeable {
     private final BufferedReader reader;
     private long lineNumber;
     private boolean firstDataLine = true;
+    private int from;
+    private int to;
 
     public CsvEdgeReader(Path path) throws IOException {
         this.reader = Files.newBufferedReader(path, StandardCharsets.UTF_8);
     }
 
-    public Optional<Edge> next() throws IOException {
+    public boolean next() throws IOException {
         String line;
         while ((line = reader.readLine()) != null) {
             lineNumber++;
@@ -30,32 +31,50 @@ public final class CsvEdgeReader implements Closeable {
                 continue;
             }
             firstDataLine = false;
-            return Optional.of(parseEdge(trimmed));
+            parseEdge(trimmed);
+            return true;
         }
-        return Optional.empty();
+        return false;
     }
 
-    private Edge parseEdge(String line) {
-        String[] parts = line.split(",", -1);
-        if (parts.length < 2) {
+    public int from() {
+        return from;
+    }
+
+    public int to() {
+        return to;
+    }
+
+    private void parseEdge(String line) {
+        int comma = line.indexOf(',');
+        if (comma < 0) {
             throw new IllegalArgumentException("invalid CSV edge at line " + lineNumber
-                    + ": expected at least two columns, got " + parts.length + ": " + line);
+                    + ": expected at least two columns: " + line);
         }
-        if (parts[0].isBlank() || parts[1].isBlank()) {
+        int secondComma = line.indexOf(',', comma + 1);
+        int toEnd = secondComma >= 0 ? secondComma : line.length();
+        String fromText = line.substring(0, comma).trim();
+        String toText = line.substring(comma + 1, toEnd).trim();
+        if (fromText.isEmpty() || toText.isEmpty()) {
             throw new IllegalArgumentException("empty vertex id at line " + lineNumber + ": " + line);
         }
         try {
-            return new Edge(Integer.parseInt(parts[0].trim()), Integer.parseInt(parts[1].trim()));
+            from = Integer.parseInt(fromText);
+            to = Integer.parseInt(toText);
         } catch (NumberFormatException ex) {
             throw new IllegalArgumentException("invalid int32 vertex id at line " + lineNumber + ": " + line, ex);
         }
     }
 
     private boolean isHeader(String line) {
-        String[] parts = line.split(",", -1);
-        return parts.length >= 2
-                && "from".equalsIgnoreCase(parts[0].trim())
-                && "to".equalsIgnoreCase(parts[1].trim());
+        int comma = line.indexOf(',');
+        if (comma < 0) {
+            return false;
+        }
+        int secondComma = line.indexOf(',', comma + 1);
+        int toEnd = secondComma >= 0 ? secondComma : line.length();
+        return "from".equalsIgnoreCase(line.substring(0, comma).trim())
+                && "to".equalsIgnoreCase(line.substring(comma + 1, toEnd).trim());
     }
 
     @Override
@@ -63,6 +82,4 @@ public final class CsvEdgeReader implements Closeable {
         reader.close();
     }
 
-    public record Edge(int from, int to) {
-    }
 }

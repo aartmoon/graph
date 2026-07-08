@@ -14,6 +14,7 @@ public record AppConfig(
         IdMode idMode,
         int topK,
         int gatherChunkCacheSize,
+        long scatterSliceBytes,
         boolean keepMessages
 ) {
     public static final int MAX_TOP_K = 1_000_000;
@@ -55,14 +56,17 @@ public record AppConfig(
         if (gatherChunkCacheSize <= 0) {
             throw new IllegalArgumentException("--gather-chunk-cache-size must be positive");
         }
+        if (scatterSliceBytes <= 0) {
+            throw new IllegalArgumentException("--scatter-slice-mb must be positive");
+        }
     }
 
     public enum IdMode {
-        CONTIGUOUS;
+        EXTERNAL_DENSE;
 
         public static IdMode fromCliValue(String value) {
-            if ("contiguous".equalsIgnoreCase(value)) {
-                return CONTIGUOUS;
+            if ("external-dense".equalsIgnoreCase(value) || "contiguous".equalsIgnoreCase(value)) {
+                return EXTERNAL_DENSE;
             }
             throw new IllegalArgumentException("unsupported --id-mode: " + value);
         }

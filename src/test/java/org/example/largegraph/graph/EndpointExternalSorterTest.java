@@ -50,33 +50,34 @@ final class EndpointExternalSorterTest {
         assertEquals(expected, readEndpointRefs(output));
     }
 
-//    @Test
-//    void endpointAssignmentSorterOrdersPrimitiveRunsAndMergePasses() throws IOException {
-//        Path input = tempDir.resolve("endpoint_assignments.bin");
-//        Path output = tempDir.resolve("endpoint_assignments.sorted.bin");
-//        List<EndpointAssignmentRecord> records = new ArrayList<>();
-//        for (int i = 149; i >= 0; i--) {
-//            records.add(new EndpointAssignmentRecord(10_000L - (i % 23), (byte) (i % 2), i));
-//        }
-//        records.add(new EndpointAssignmentRecord(5L, (byte) 1, 20));
-//        records.add(new EndpointAssignmentRecord(5L, (byte) 0, 10));
-//        records.add(new EndpointAssignmentRecord(4L, (byte) 1, 30));
-//        writeEndpointAssignments(input, records);
-//
-//        new EndpointAssignmentExternalSorter(1).sort(
-//                input,
-//                output,
-//                tempDir.resolve("sort").resolve("endpoint-assignments"),
-//                "endpoint-assignment-run"
-//        );
-//
-//        List<EndpointAssignmentRecord> expected = records.stream()
-//                .sorted(Comparator
-//                        .comparingLong(EndpointAssignmentRecord::edgeId)
-//                        .thenComparingInt(EndpointAssignmentRecord::side))
-//                .toList();
-//        assertEquals(expected, readEndpointAssignments(output));
-//    }
+    @Test
+    void endpointAssignmentSorterOrdersPrimitiveRunsAndMergePasses() throws IOException {
+        Path input = tempDir.resolve("endpoint_assignments.bin");
+        Path output = tempDir.resolve("endpoint_assignments.sorted.bin");
+        List<EndpointAssignmentRecord> records = new ArrayList<>();
+        for (int i = 149; i >= 0; i--) {
+            records.add(new EndpointAssignmentRecord(10_000L - (i % 23), (byte) (i % 2), i));
+        }
+        records.add(new EndpointAssignmentRecord(5L, (byte) 1, 20));
+        records.add(new EndpointAssignmentRecord(5L, (byte) 0, 10));
+        records.add(new EndpointAssignmentRecord(4L, (byte) 1, 30));
+        writeEndpointAssignments(input, records);
+
+        new EndpointAssignmentExternalSorter(1).sort(
+                input,
+                output,
+                tempDir.resolve("sort").resolve("endpoint-assignments"),
+                "endpoint-assignment-run"
+        );
+
+        List<EndpointAssignmentRecord> expected = records.stream()
+                .sorted(Comparator
+                        .comparingLong(EndpointAssignmentRecord::edgeId)
+                        .thenComparingInt(EndpointAssignmentRecord::side)
+                        .thenComparingInt(EndpointAssignmentRecord::denseId))
+                .toList();
+        assertEquals(expected, readEndpointAssignments(output));
+    }
 
     private static void writeEndpointRefs(Path path, List<EndpointRefRecord> records) throws IOException {
         try (DataOutputStream output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)))) {

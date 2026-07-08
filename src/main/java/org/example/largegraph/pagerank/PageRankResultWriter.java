@@ -9,6 +9,7 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -30,6 +31,7 @@ public final class PageRankResultWriter {
         } else {
             writeAllStreaming(result);
         }
+        writeRunSummary(result);
     }
 
     private void writeAllStreaming(PageRankRunResult result) throws IOException {
@@ -103,6 +105,50 @@ public final class PageRankResultWriter {
             heap.poll();
             heap.add(new RankEntry(vertex, rank));
         }
+    }
+
+    private void writeRunSummary(PageRankRunResult result) throws IOException {
+        Path summaryPath = summaryPath();
+        try (BufferedWriter writer = Files.newBufferedWriter(summaryPath, StandardCharsets.UTF_8)) {
+            writer.write("{");
+            writer.newLine();
+            writeJsonNumber(writer, "vertices", result.vertexCount(), true);
+            writeJsonNumber(writer, "edges", result.edgeCount(), true);
+            writeJsonNumber(writer, "iterations", result.iterations(), true);
+            writeJsonString(writer, "status", result.status(), true);
+            writeJsonNumber(writer, "lastDelta", result.lastDelta(), true);
+            writeJsonNumber(writer, "rankSum", result.rankSum(), true);
+            writeJsonNumber(writer, "damping", config.damping(), true);
+            writeJsonNumber(writer, "chunkSize", config.chunkSize(), true);
+            writeJsonNumber(writer, "threads", config.threads(), false);
+            writer.write("}");
+            writer.newLine();
+        }
+    }
+
+    private Path summaryPath() {
+        Path output = config.output();
+        String fileName = output.getFileName().toString();
+        String summaryName = fileName.endsWith(".csv")
+                ? fileName.substring(0, fileName.length() - 4) + ".meta.json"
+                : fileName + ".meta.json";
+        Path parent = output.getParent();
+        return parent == null ? Path.of(summaryName) : parent.resolve(summaryName);
+    }
+
+    private void writeJsonNumber(BufferedWriter writer, String key, long value, boolean comma) throws IOException {
+        writer.write("  \"%s\": %d%s".formatted(key, value, comma ? "," : ""));
+        writer.newLine();
+    }
+
+    private void writeJsonNumber(BufferedWriter writer, String key, double value, boolean comma) throws IOException {
+        writer.write("  \"%s\": %s%s".formatted(key, Double.toString(value), comma ? "," : ""));
+        writer.newLine();
+    }
+
+    private void writeJsonString(BufferedWriter writer, String key, String value, boolean comma) throws IOException {
+        writer.write("  \"%s\": \"%s\"%s".formatted(key, value.replace("\\", "\\\\").replace("\"", "\\\""), comma ? "," : ""));
+        writer.newLine();
     }
 
     private record RankEntry(int vertex, double rank) {

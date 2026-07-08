@@ -177,9 +177,10 @@ final class PageRankEngineTest {
                 0.85,
                 maxIterations,
                 1e-10,
-                AppConfig.IdMode.CONTIGUOUS,
+                AppConfig.IdMode.EXTERNAL_DENSE,
                 0,
                 8,
+                16L * 1024L * 1024L,
                 false
         );
         GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();

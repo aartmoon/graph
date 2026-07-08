@@ -104,6 +104,7 @@ final class EndpointAssignmentExternalSorter {
         PriorityQueue<Cursor> queue = new PriorityQueue<>(Comparator
                 .comparingLong(Cursor::edgeId)
                 .thenComparingInt(Cursor::side)
+                .thenComparingInt(Cursor::denseId)
                 .thenComparingInt(Cursor::runId));
         List<Reader> readers = new ArrayList<>(runs.size());
         IOException failure = null;
@@ -143,13 +144,14 @@ final class EndpointAssignmentExternalSorter {
             int pivotIndex = low + ((high - low) >>> 1);
             long pivotEdgeId = chunk.edgeIds[pivotIndex];
             byte pivotSide = chunk.sides[pivotIndex];
+            int pivotDenseId = chunk.denseIds[pivotIndex];
             int i = low;
             int j = high;
             while (i <= j) {
-                while (compare(chunk, i, pivotEdgeId, pivotSide) < 0) {
+                while (compare(chunk, i, pivotEdgeId, pivotSide, pivotDenseId) < 0) {
                     i++;
                 }
-                while (compare(chunk, j, pivotEdgeId, pivotSide) > 0) {
+                while (compare(chunk, j, pivotEdgeId, pivotSide, pivotDenseId) > 0) {
                     j--;
                 }
                 if (i <= j) {
@@ -178,7 +180,7 @@ final class EndpointAssignmentExternalSorter {
             byte side = chunk.sides[i];
             int denseId = chunk.denseIds[i];
             int j = i - 1;
-            while (j >= low && compare(chunk, j, edgeId, side) > 0) {
+            while (j >= low && compare(chunk, j, edgeId, side, denseId) > 0) {
                 chunk.edgeIds[j + 1] = chunk.edgeIds[j];
                 chunk.sides[j + 1] = chunk.sides[j];
                 chunk.denseIds[j + 1] = chunk.denseIds[j];
@@ -190,12 +192,16 @@ final class EndpointAssignmentExternalSorter {
         }
     }
 
-    private int compare(Chunk chunk, int index, long edgeId, byte side) {
+    private int compare(Chunk chunk, int index, long edgeId, byte side, int denseId) {
         int compared = Long.compare(chunk.edgeIds[index], edgeId);
         if (compared != 0) {
             return compared;
         }
-        return Byte.compare(chunk.sides[index], side);
+        compared = Byte.compare(chunk.sides[index], side);
+        if (compared != 0) {
+            return compared;
+        }
+        return Integer.compare(chunk.denseIds[index], denseId);
     }
 
     private void swap(Chunk chunk, int left, int right) {

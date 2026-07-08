@@ -18,15 +18,17 @@ public final class ArgsParser {
             "--id-mode",
             "--top-k",
             "--gather-chunk-cache-size",
+            "--scatter-slice-mb",
             "--keep-messages"
     );
 
     private static final double DEFAULT_DAMPING = 0.85;
     private static final int DEFAULT_MAX_ITERATIONS = 200;
     private static final double DEFAULT_EPSILON = 1e-8;
-    private static final AppConfig.IdMode DEFAULT_ID_MODE = AppConfig.IdMode.CONTIGUOUS;
+    private static final AppConfig.IdMode DEFAULT_ID_MODE = AppConfig.IdMode.EXTERNAL_DENSE;
     private static final int DEFAULT_TOP_K = 0;
     private static final int DEFAULT_GATHER_CHUNK_CACHE_SIZE = 8;
+    private static final int DEFAULT_SCATTER_SLICE_MB = 16;
     private static final boolean DEFAULT_KEEP_MESSAGES = false;
 
     private ArgsParser() {
@@ -48,6 +50,7 @@ public final class ArgsParser {
                 values.containsKey("--id-mode") ? AppConfig.IdMode.fromCliValue(values.get("--id-mode")) : DEFAULT_ID_MODE,
                 parseNonNegativeInt(values, "--top-k", DEFAULT_TOP_K),
                 parsePositiveInt(values, "--gather-chunk-cache-size", DEFAULT_GATHER_CHUNK_CACHE_SIZE),
+                scatterSliceBytes(values),
                 parseBoolean(values, "--keep-messages", DEFAULT_KEEP_MESSAGES)
         );
     }
@@ -64,9 +67,10 @@ public final class ArgsParser {
                     --damping 0.85 \\
                     --max-iterations 200 \\
                     --epsilon 1e-8 \\
-                    --id-mode contiguous \\
+                    --id-mode external-dense \\
                     --top-k 0 \\
                     --gather-chunk-cache-size 8 \\
+                    --scatter-slice-mb 16 \\
                     --keep-messages false
                 """;
     }
@@ -162,5 +166,10 @@ public final class ArgsParser {
             return false;
         }
         throw new IllegalArgumentException(option + " must be true or false");
+    }
+
+    private static long scatterSliceBytes(Map<String, String> values) {
+        int megabytes = parsePositiveInt(values, "--scatter-slice-mb", DEFAULT_SCATTER_SLICE_MB);
+        return Math.multiplyExact((long) megabytes, 1024L * 1024L);
     }
 }

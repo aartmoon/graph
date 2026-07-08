@@ -16,16 +16,22 @@ public final class DiskDoubleArray implements Closeable {
     private final int chunkSize;
     private final FileChannel channel;
     private final boolean writable;
+    private final boolean forceOnClose;
 
     public DiskDoubleArray(Path path, long length, int chunkSize) throws IOException {
         this(path, length, chunkSize, true);
     }
 
     public DiskDoubleArray(Path path, long length, int chunkSize, boolean writable) throws IOException {
+        this(path, length, chunkSize, writable, true);
+    }
+
+    public DiskDoubleArray(Path path, long length, int chunkSize, boolean writable, boolean forceOnClose) throws IOException {
         this.path = path;
         this.length = length;
         this.chunkSize = chunkSize;
         this.writable = writable;
+        this.forceOnClose = forceOnClose;
         if (writable && path.getParent() != null) {
             Files.createDirectories(path.getParent());
         }
@@ -161,7 +167,9 @@ public final class DiskDoubleArray implements Closeable {
 
     @Override
     public void close() throws IOException {
-        flush();
+        if (forceOnClose) {
+            flush();
+        }
         channel.close();
     }
 }

@@ -63,7 +63,7 @@ from,to
 Preprocessing:
 
 1. CSV читается потоково.
-2. Пишутся `raw_edges.bin` и `vertex_ids_unsorted.bin`.
+2. Пишутся `vertex_ids_unsorted.bin` и `endpoint_refs.bin`.
 3. `vertex_ids_unsorted.bin` сортируется внешней сортировкой по int chunks.
 4. Во время merge выполняется deduplicate.
 5. Пишутся:
@@ -72,7 +72,10 @@ Preprocessing:
 6. Endpoint references сортируются по `originalId`.
 7. Sort-merge join с `mapping.bin` переписывает endpoints в dense ids.
 8. Endpoint assignments сортируются по `(edgeId, side)`.
-9. Dense edges пишутся сразу в `edges_by_source/src-part-xxxxx.bin`.
+9. Dense edges пишутся во временный stream.
+10. Dense edges сортируются по `(denseFrom, denseTo)` и deduplicate-ятся.
+11. Unique dense edges пишутся в `edges_by_source/src-part-xxxxx.bin`.
+12. После построения graph storage preprocessing intermediates удаляются.
 
 В heap не создается `HashMap<originalId, denseId>` для всех вершин.
 
@@ -103,17 +106,7 @@ from,to,weight,comment
 ```text
 work/
   meta.properties
-  raw_edges.bin
-  vertex_ids_unsorted.bin
   vertices.bin
-  mapping.bin
-  endpoint_refs.bin
-  endpoint_refs.sorted.bin
-  endpoint_assignments.bin
-  endpoint_assignments.sorted.bin
-
-  sort/
-    ...
 
   vertex/
     out_degree.bin
@@ -137,17 +130,16 @@ work/
 Форматы:
 
 ```text
-raw_edges.bin:              long edgeId, int fromOriginal, int toOriginal
-vertex_ids_unsorted.bin:    int originalId
 vertices.bin:               int originalId
-mapping.bin:                int originalId, int denseId
-endpoint_refs.bin:          int originalId, long edgeId, byte side
-endpoint_assignments.bin:   long edgeId, byte side, int denseId
 src-part-xxxxx.bin:         int denseFrom, int denseTo
 message bucket file:        int denseTo, double contribution
 rank files:                 double rank[denseId]
 out_degree.bin:             int outDegree[denseId]
 ```
+
+Во время preprocessing также временно создаются `vertex_ids_unsorted.bin`, `mapping.bin`,
+`endpoint_refs*.bin`, `endpoint_assignments*.bin`, `dense_edges*.bin` и `sort/`; после построения
+`edges_by_source`, `vertices.bin`, `out_degree.bin` и rank-файлов они удаляются.
 
 ## Out-Degree
 
@@ -248,7 +240,7 @@ int sort chunk <= 500000 ids
 endpoint record sort chunk <= 250000 records
 ```
 
-Runtime warning остается advisory и отдельно показывает `pagerankChunkEstimate`, `gatherCacheEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate`, `topKEstimate` и `maxHeap`; это не полноценный memory planner.
+Runtime warning остается advisory и отдельно показывает `scatterEstimate`, `gatherCacheEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate`, `topKEstimate` и `maxHeap`; это не полноценный memory planner.
 
 В heap не хранятся:
 
@@ -270,15 +262,18 @@ messages per iteration: O(E)
 Preprocessing может требовать несколько размеров edge storage во временном диске:
 
 ```text
-raw_edges.bin              O(E)
 vertex_ids_unsorted.bin    O(E)
 endpoint_refs.bin          O(E)
 endpoint_refs.sorted.bin   O(E)
 endpoint_assignments.bin   O(E)
 endpoint_assignments.sorted.bin O(E)
+dense_edges.bin            O(E)
+dense_edges.sorted.bin     O(E)
 sort runs                  O(E + V)
 edges_by_source            O(E)
 ```
+
+Эти preprocessing temporary files удаляются после успешного preprocessing.
 
 Message IO остается `O(E)` на итерацию. Message buckets уменьшают file-count и metadata overhead, но не меняют асимптотику. Message record больше edge record:
 
@@ -291,13 +286,14 @@ message record: int,double     = 12 bytes
 
 Гипер-узел не разворачивается в adjacency list. Его ребра остаются последовательными records в source partition. Scatter читает partition потоково, а scheduling запускает более тяжелые partitions раньше.
 
-Если один source chunk содержит огромный гипер-узел, scatter режет файл source partition на byte-aligned edge slices и может распределить slices между worker buckets. Каждый slice читается позиционно и потоково; adjacency list по-прежнему не создается.
+Если один source chunk содержит огромный гипер-узел, scatter режет файл source partition на byte-aligned edge slices и может распределить slices между worker buckets. Размер slice задается `--scatter-slice-mb` с default `16`. Внутри worker slices группируются по source partition, поэтому файл partition открывается один раз на группу и читается позиционно; adjacency list по-прежнему не создается.
 
 ## Детерминизм
 
 - dense ids назначаются в порядке ascending original id;
 - source partitions определяются как `denseFrom / chunkSize`;
 - destination partitions определяются как `denseTo / chunkSize`;
+- duplicate input edges схлопываются после dense rewrite, граф считается unweighted simple directed graph;
 - manifests пишутся sorted by partition id;
 - gather читает worker directories и manifest entries в стабильном порядке;
 - output deterministic для одинакового input/config.
@@ -343,13 +339,14 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
   --damping 0.85 \
   --max-iterations 200 \
   --epsilon 1e-8 \
-  --id-mode contiguous \
+  --id-mode external-dense \
   --top-k 0 \
   --gather-chunk-cache-size 8 \
+  --scatter-slice-mb 16 \
   --keep-messages false
 ```
 
-`--id-mode contiguous` сохранен как CLI-совместимое имя, но preprocessing теперь делает external dense reindexing observed ids.
+`--id-mode external-dense` явно означает external dense reindexing observed ids. `contiguous` сохранен как CLI-совместимый alias.
 
 ## Synthetic Graph
 
@@ -381,10 +378,11 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 - hot-path sort для endpoint refs/assignments использует primitive arrays, generic record sorter оставлен как fallback;
 - sort run metadata bounded: при превышении merge fan-in runs инкрементально compact-ятся;
 - preprocessing делает несколько disk passes;
+- preprocessing intermediate files удаляются после построения persistent graph storage;
 - messages занимают `O(E)` временного места на каждой итерации: на каждое ребро пишется record `int denseTo,double contribution` при наличии исходящей степени;
 - число unique observed vertices должно помещаться в `int denseId`;
 - `partitionCount = ceil(V / chunkSize)` должен помещаться в `int`;
-- preprocessing может требовать несколько размеров исходного edge storage во временном диске;
+- preprocessing во время работы может требовать несколько размеров исходного edge storage во временном диске;
 - compression/checkpoint/resume пока нет;
 - recursive cleanup использует streaming `walkFileTree`, без materialization всех paths в heap;
 - binary readers валидируют кратность file size record size и не проглатывают partial records;
