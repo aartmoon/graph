@@ -9,11 +9,11 @@ final class MessageBucketLayoutTest {
     void assignsContiguousDenseVertexRangesToBuckets() {
         MessageBucketLayout layout = new MessageBucketLayout(17, 1_000, 16_384);
 
-        assertEquals(8_192, layout.bucketCount());
+        assertEquals(17, layout.bucketCount());
         assertEquals(0, layout.bucketFor(0, 0));
-        assertEquals(0, layout.bucketFor(0, 1));
-        assertEquals(1, layout.bucketFor(0, 2));
-        assertEquals(7_500, layout.bucketFor(15, 15_000));
+        assertEquals(0, layout.bucketFor(0, 999));
+        assertEquals(1, layout.bucketFor(1, 1_000));
+        assertEquals(15, layout.bucketFor(15, 15_000));
         assertEquals(layout.bucketCount() - 1, layout.bucketFor(16, 16_383));
     }
 

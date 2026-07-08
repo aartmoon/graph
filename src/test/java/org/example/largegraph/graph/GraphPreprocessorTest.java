@@ -131,6 +131,20 @@ final class GraphPreprocessorTest {
     }
 
     @Test
+    void csvReaderStripsUtf8BomFromHeader() throws IOException {
+        Path input = tempDir.resolve("bom.csv");
+        Path output = tempDir.resolve("output").resolve("pagerank.csv");
+        Path workDir = tempDir.resolve("bom-work");
+        Files.writeString(input, "\uFEFFfrom,to\n1,2\n");
+
+        AppConfig config = config(input, output, workDir, 4, 2);
+        GraphPreprocessor.PreprocessingResult result = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
+
+        assertEquals(2, result.vertexCount());
+        assertEquals(1, result.edgeCount());
+    }
+
+    @Test
     void supportsNegativeOriginalVertexIds() throws IOException {
         Path input = tempDir.resolve("edges.csv");
         Files.writeString(input, "from,to\n-1,2\n");
@@ -168,7 +182,6 @@ final class GraphPreprocessorTest {
                 1e-8,
                 AppConfig.IdMode.EXTERNAL_DENSE,
                 0,
-                8,
                 16L * 1024L * 1024L,
                 false
         );

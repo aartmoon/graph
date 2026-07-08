@@ -22,6 +22,9 @@ public final class CsvEdgeReader implements Closeable {
         String line;
         while ((line = reader.readLine()) != null) {
             lineNumber++;
+            if (lineNumber == 1 && line.startsWith("\uFEFF")) {
+                line = line.substring(1);
+            }
             String trimmed = line.trim();
             if (trimmed.isEmpty()) {
                 continue;

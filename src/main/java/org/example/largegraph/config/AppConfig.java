@@ -13,7 +13,6 @@ public record AppConfig(
         double epsilon,
         IdMode idMode,
         int topK,
-        int gatherChunkCacheSize,
         long scatterSliceBytes,
         boolean keepMessages
 ) {
@@ -52,9 +51,6 @@ public record AppConfig(
         }
         if (topK > MAX_TOP_K) {
             throw new IllegalArgumentException("--top-k must be <= " + MAX_TOP_K);
-        }
-        if (gatherChunkCacheSize <= 0) {
-            throw new IllegalArgumentException("--gather-chunk-cache-size must be positive");
         }
         if (scatterSliceBytes <= 0) {
             throw new IllegalArgumentException("--scatter-slice-mb must be positive");

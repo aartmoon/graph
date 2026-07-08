@@ -17,8 +17,11 @@ import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -47,43 +50,52 @@ public final class GraphPreprocessor {
     public PreprocessingResult preprocess() throws IOException {
         validateInput();
         prepareWorkDir();
+        checkFreeDiskSpace();
 
-        FirstPassStats stats = runFirstPass();
-        ExternalIntSorter.SortUniqueResult vertices = sortVertices();
-        long vertexCount = vertices.uniqueCount();
-        int partitionCount = partitionCount(vertexCount);
+        boolean success = false;
+        try {
+            FirstPassStats stats = runFirstPass();
+            ExternalIntSorter.SortUniqueResult vertices = sortVertices();
+            long vertexCount = vertices.uniqueCount();
+            int partitionCount = partitionCount(vertexCount);
 
-        Path vertexDir = config.workDir().resolve("vertex");
-        Files.createDirectories(vertexDir);
+            Path vertexDir = config.workDir().resolve("vertex");
+            Files.createDirectories(vertexDir);
 
-        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize());
-             DiskDoubleArray rankCurrent = new DiskDoubleArray(rankCurrentPath(), vertexCount, config.chunkSize());
-             DiskDoubleArray rankNext = new DiskDoubleArray(rankNextPath(), vertexCount, config.chunkSize())) {
-            outDegree.fill(0);
-            rankCurrent.fill(1.0 / vertexCount);
-            rankNext.fill(0.0);
+            try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize());
+                 DiskDoubleArray rankCurrent = new DiskDoubleArray(rankCurrentPath(), vertexCount, config.chunkSize());
+                 DiskDoubleArray rankNext = new DiskDoubleArray(rankNextPath(), vertexCount, config.chunkSize())) {
+                outDegree.fill(0);
+                rankCurrent.fill(1.0 / vertexCount);
+                rankNext.fill(0.0);
+            }
+
+            long edgeCount = rewriteEdgesToDenseSourcePartitions(partitionCount);
+            buildOutDegreeBySourcePartition(vertexCount, partitionCount);
+            writeSourcePartitionMetadata(partitionCount);
+            writeMetadata(vertexCount, edgeCount, partitionCount);
+            cleanupPreprocessingIntermediates();
+
+            logger.info("Preprocessing finished: vertices=%d inputEdges=%d storedEdges=%d sourcePartitions=%d"
+                    .formatted(vertexCount, stats.edgeCount(), edgeCount, partitionCount));
+            success = true;
+            return new PreprocessingResult(
+                    vertexCount,
+                    edgeCount,
+                    partitionCount,
+                    partitionCount,
+                    config.chunkSize(),
+                    outDegreePath(),
+                    rankCurrentPath(),
+                    rankNextPath(),
+                    edgesDir(),
+                    verticesPath()
+            );
+        } finally {
+            if (!success) {
+                cleanupPreprocessingIntermediatesSafely();
+            }
         }
-
-        long edgeCount = rewriteEdgesToDenseSourcePartitions(partitionCount);
-        buildOutDegreeBySourcePartition(vertexCount, partitionCount);
-        writeSourcePartitionMetadata(partitionCount);
-        writeMetadata(vertexCount, edgeCount, partitionCount);
-        cleanupPreprocessingIntermediates();
-
-        logger.info("Preprocessing finished: vertices=%d inputEdges=%d storedEdges=%d sourcePartitions=%d"
-                .formatted(vertexCount, stats.edgeCount(), edgeCount, partitionCount));
-        return new PreprocessingResult(
-                vertexCount,
-                edgeCount,
-                partitionCount,
-                partitionCount,
-                config.chunkSize(),
-                outDegreePath(),
-                rankCurrentPath(),
-                rankNextPath(),
-                edgesDir(),
-                verticesPath()
-        );
     }
 
     private FirstPassStats runFirstPass() throws IOException {
@@ -261,15 +273,25 @@ public final class GraphPreprocessor {
     }
 
     private void buildOutDegreeForSourcePartitionRange(long vertexCount, PartitionRange range) throws IOException {
-        for (int sourcePartition = range.startPartition(); sourcePartition < range.endPartitionExclusive(); sourcePartition++) {
-            buildOutDegreeForSourcePartition(vertexCount, sourcePartition);
+        int[] outDegreeChunk = new int[config.chunkSize()];
+        ByteBuffer scratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
+        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize(), true, false)) {
+            for (int sourcePartition = range.startPartition(); sourcePartition < range.endPartitionExclusive(); sourcePartition++) {
+                buildOutDegreeForSourcePartition(outDegree, vertexCount, sourcePartition, outDegreeChunk, scratch);
+            }
         }
     }
 
-    private void buildOutDegreeForSourcePartition(long vertexCount, int sourcePartition) throws IOException {
+    private void buildOutDegreeForSourcePartition(
+            DiskIntArray outDegree,
+            long vertexCount,
+            int sourcePartition,
+            int[] outDegreeChunk,
+            ByteBuffer scratch
+    ) throws IOException {
         long sourceStart = (long) sourcePartition * config.chunkSize();
         int sourceLength = (int) Math.min(config.chunkSize(), vertexCount - sourceStart);
-        int[] outDegreeChunk = new int[sourceLength];
+        Arrays.fill(outDegreeChunk, 0, sourceLength, 0);
         Path sourcePartitionPath = edgesDir().resolve("src-part-%05d.bin".formatted(sourcePartition));
         if (Files.exists(sourcePartitionPath)) {
             try (BinaryEdgeReader edgeReader = new BinaryEdgeReader(sourcePartitionPath)) {
@@ -280,9 +302,7 @@ public final class GraphPreprocessor {
             }
         }
 
-        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize(), true, false)) {
-            outDegree.writeIntChunk(sourceStart, outDegreeChunk, sourceLength);
-        }
+        outDegree.writeIntChunk(sourceStart, outDegreeChunk, sourceLength, scratch);
     }
 
     private void writeSourcePartitionMetadata(int partitionCount) throws IOException {
@@ -312,6 +332,25 @@ public final class GraphPreprocessor {
         }
         if (!Files.isRegularFile(config.input())) {
             throw new IllegalArgumentException("input path is not a regular file: " + config.input());
+        }
+    }
+
+    private void checkFreeDiskSpace() throws IOException {
+        FileStore store = Files.getFileStore(config.workDir());
+        long free = store.getUsableSpace();
+        long inputSize = Files.size(config.input());
+        long estimatedRequired = saturatingMultiply(inputSize, 8L);
+        if (free < estimatedRequired) {
+            throw new IllegalStateException("not enough disk space: free=%d estimatedRequired=%d"
+                    .formatted(free, estimatedRequired));
+        }
+    }
+
+    private long saturatingMultiply(long left, long right) {
+        try {
+            return Math.multiplyExact(left, right);
+        } catch (ArithmeticException ex) {
+            return Long.MAX_VALUE;
         }
     }
 
@@ -355,6 +394,14 @@ public final class GraphPreprocessor {
         Files.deleteIfExists(denseEdgesPath());
         Files.deleteIfExists(denseEdgesSortedPath());
         deleteRecursively(config.workDir().resolve("sort"));
+    }
+
+    private void cleanupPreprocessingIntermediatesSafely() {
+        try {
+            cleanupPreprocessingIntermediates();
+        } catch (IOException cleanupEx) {
+            logger.info("WARNING failed to cleanup preprocessing intermediates: " + cleanupEx.getMessage());
+        }
     }
 
     private void writeMetadata(long vertexCount, long edgeCount, int partitionCount) throws IOException {

@@ -21,7 +21,6 @@ final class ArgsParserTest {
         assertEquals(1e-8, config.epsilon());
         assertEquals(AppConfig.IdMode.EXTERNAL_DENSE, config.idMode());
         assertEquals(0, config.topK());
-        assertEquals(16, config.gatherChunkCacheSize());
         assertEquals(32L * 1024L * 1024L, config.scatterSliceBytes());
         assertFalse(config.keepMessages());
     }
@@ -41,7 +40,6 @@ final class ArgsParserTest {
         assertEquals(1e-8, config.epsilon());
         assertEquals(AppConfig.IdMode.EXTERNAL_DENSE, config.idMode());
         assertEquals(0, config.topK());
-        assertEquals(8, config.gatherChunkCacheSize());
         assertEquals(16L * 1024L * 1024L, config.scatterSliceBytes());
         assertFalse(config.keepMessages());
     }
@@ -79,7 +77,6 @@ final class ArgsParserTest {
                 "--epsilon", "1e-8",
                 "--id-mode", "external-dense",
                 "--top-k", "0",
-                "--gather-chunk-cache-size", "16",
                 "--scatter-slice-mb", "32",
                 "--keep-messages", "false"
         };

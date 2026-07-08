@@ -22,8 +22,8 @@ public final class MessageBucketLayout {
         this.destinationPartitionCount = destinationPartitionCount;
         this.chunkSize = chunkSize;
         this.vertexCount = vertexCount;
-        int targetBucketCount = Math.toIntExact(Math.min(vertexCount, (long) MAX_BUCKETS));
-        this.verticesPerBucket = Math.ceilDiv(vertexCount, targetBucketCount);
+        long calculatedVerticesPerBucket = Math.ceilDiv(vertexCount, MAX_BUCKETS);
+        this.verticesPerBucket = Math.max(chunkSize, calculatedVerticesPerBucket);
         this.bucketCount = Math.toIntExact(Math.ceilDiv(vertexCount, verticesPerBucket));
     }
 
@@ -65,6 +65,10 @@ public final class MessageBucketLayout {
 
     public int bucketCount() {
         return bucketCount;
+    }
+
+    public long verticesPerBucket() {
+        return verticesPerBucket;
     }
 
     private void validateBucket(int bucket) {

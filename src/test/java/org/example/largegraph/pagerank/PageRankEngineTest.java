@@ -137,15 +137,14 @@ final class PageRankEngineTest {
         try (MessagePartitionWriterManager writers = new MessagePartitionWriterManager(workerDir, 4, 2, 8, 2)) {
             writers.write(2, 5, 0.25);
             writers.write(0, 1, 0.75);
-            writers.write(2, 6, 0.5);
+            writers.write(3, 6, 0.5);
         }
 
-        assertEquals(List.of("1", "5", "6"), Files.readAllLines(workerDir.resolve("manifest.txt")));
-        assertTrue(Files.exists(workerDir.resolve("msg-bucket-00001.bin")));
-        assertTrue(Files.exists(workerDir.resolve("msg-bucket-00005.bin")));
-        assertTrue(Files.exists(workerDir.resolve("msg-bucket-00006.bin")));
-        assertTrue(Files.notExists(workerDir.resolve("msg-bucket-00000.bin")));
-        assertTrue(Files.notExists(workerDir.resolve("msg-bucket-00002.bin")));
+        assertEquals(List.of("0", "2", "3"), Files.readAllLines(workerDir.resolve("manifest.txt")));
+        assertTrue(Files.exists(workerDir.resolve("msg-bucket-00000.bin")));
+        assertTrue(Files.exists(workerDir.resolve("msg-bucket-00002.bin")));
+        assertTrue(Files.exists(workerDir.resolve("msg-bucket-00003.bin")));
+        assertTrue(Files.notExists(workerDir.resolve("msg-bucket-00001.bin")));
     }
 
     @Test
@@ -208,7 +207,6 @@ final class PageRankEngineTest {
                 1e-10,
                 AppConfig.IdMode.EXTERNAL_DENSE,
                 0,
-                8,
                 16L * 1024L * 1024L,
                 false
         );
