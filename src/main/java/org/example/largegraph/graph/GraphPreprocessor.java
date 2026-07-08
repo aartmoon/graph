@@ -280,7 +280,7 @@ public final class GraphPreprocessor {
             }
         }
 
-        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize())) {
+        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize(), true, false)) {
             outDegree.writeIntChunk(sourceStart, outDegreeChunk, sourceLength);
         }
     }

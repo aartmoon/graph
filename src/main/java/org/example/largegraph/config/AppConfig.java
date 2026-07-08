@@ -62,26 +62,12 @@ public record AppConfig(
         validateBufferSize("--chunk-size for double chunks", chunkSize, Double.BYTES);
         validateBufferSize("--chunk-size for int chunks", chunkSize, Integer.BYTES);
         validateBufferSize("--scatter-slice-mb", scatterSliceBytes, 1);
-        validateGatherMemoryShape(chunkSize, gatherChunkCacheSize, threads);
     }
 
     private static void validateBufferSize(String option, long itemCount, int bytesPerItem) {
         long bytes = Math.multiplyExact(itemCount, bytesPerItem);
         if (bytes > Integer.MAX_VALUE) {
             throw new IllegalArgumentException(option + " is too large: required buffer bytes=" + bytes);
-        }
-    }
-
-    private static void validateGatherMemoryShape(int chunkSize, int gatherChunkCacheSize, int threads) {
-        long perChunkBytes = Math.multiplyExact((long) chunkSize, Double.BYTES * 2L);
-        long cacheBytes = Math.multiplyExact(perChunkBytes, gatherChunkCacheSize);
-        long totalBytes = Math.multiplyExact(cacheBytes, threads);
-        long maxHeap = Runtime.getRuntime().maxMemory();
-        if (totalBytes > maxHeap * 3L / 4L) {
-            throw new IllegalArgumentException(
-                    "gather cache configuration is too large for max heap: estimated=%d maxHeap=%d"
-                            .formatted(totalBytes, maxHeap)
-            );
         }
     }
 

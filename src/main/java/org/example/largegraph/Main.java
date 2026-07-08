@@ -55,16 +55,16 @@ public final class Main {
                 safeMultiply(config.chunkSize(), (long) Double.BYTES + Integer.BYTES),
                 activeTasks
         );
-        long gatherCacheEstimate = safeMultiply(
-                safeMultiply(config.chunkSize(), (long) Double.BYTES * 2L),
-                safeMultiply(config.gatherChunkCacheSize(), activeTasks)
+        long gatherRangeEstimate = safeMultiply(
+                safeMultiply(config.chunkSize(), (long) Double.BYTES),
+                activeTasks
         );
         long intSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK), Integer.BYTES);
         long recordSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_RECORD_SORT_CHUNK), 32L);
         long topKEstimate = safeMultiply(config.topK(), 32L);
         long maxHeap = MemoryUtils.maxHeapBytes();
         long largestEstimate = Math.max(
-                Math.max(Math.max(scatterEstimate, gatherCacheEstimate), topKEstimate),
+                Math.max(Math.max(scatterEstimate, gatherRangeEstimate), topKEstimate),
                 Math.max(intSortChunkEstimate, recordSortChunkEstimate)
         );
         if (largestEstimate > maxHeap / 2) {
@@ -72,7 +72,7 @@ public final class Main {
                     WARNING memory configuration may be risky:
                       maxHeap=%s
                       scatterEstimate=%s
-                      gatherCacheEstimate=%s
+                      gatherRangeEstimate=%s
                       intSortChunkEstimate=%s
                       recordSortChunkEstimate=%s
                       topKEstimate=%s
@@ -80,7 +80,7 @@ public final class Main {
                     .formatted(
                             MemoryUtils.humanReadableBytes(maxHeap),
                             MemoryUtils.humanReadableBytes(scatterEstimate),
-                            MemoryUtils.humanReadableBytes(gatherCacheEstimate),
+                            MemoryUtils.humanReadableBytes(gatherRangeEstimate),
                             MemoryUtils.humanReadableBytes(intSortChunkEstimate),
                             MemoryUtils.humanReadableBytes(recordSortChunkEstimate),
                             MemoryUtils.humanReadableBytes(topKEstimate)

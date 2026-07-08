@@ -23,11 +23,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -40,7 +38,6 @@ public final class PageRankEngine {
     private static final int EDGE_RECORD_BYTES = Integer.BYTES * 2;
     private static final int EDGE_READ_BUFFER_BYTES = 64 * 1024;
     private static final int MAX_TOTAL_MESSAGE_WRITERS = 256;
-    private static final long HEAVY_GATHER_BUCKET_BYTES = 64L * 1024L * 1024L;
 
     private final AppConfig config;
     private final ProgressLogger logger;
@@ -131,10 +128,14 @@ public final class PageRankEngine {
         double danglingMass = 0.0;
         try (DiskDoubleArray ranks = new DiskDoubleArray(graph.rankCurrentPath(), graph.vertexCount(), graph.chunkSize(), false);
              DiskIntArray outDegree = new DiskIntArray(graph.outDegreePath(), graph.vertexCount(), graph.chunkSize(), false)) {
+            double[] rankChunk = new double[graph.chunkSize()];
+            int[] degreeChunk = new int[graph.chunkSize()];
+            ByteBuffer rankScratch = ByteBuffer.allocate(graph.chunkSize() * Double.BYTES);
+            ByteBuffer degreeScratch = ByteBuffer.allocate(graph.chunkSize() * Integer.BYTES);
             for (long start = range.startId(); start < range.endIdExclusive(); start += graph.chunkSize()) {
                 int length = chunkLength(graph, start);
-                double[] rankChunk = ranks.readChunk(start, length);
-                int[] degreeChunk = outDegree.readIntChunk(start, length);
+                ranks.readChunk(start, rankChunk, 0, length, rankScratch);
+                outDegree.readIntChunk(start, degreeChunk, 0, length, degreeScratch);
                 for (int i = 0; i < length; i++) {
                     if (degreeChunk[i] == 0) {
                         danglingMass += rankChunk[i];
@@ -178,14 +179,24 @@ public final class PageRankEngine {
         try (DiskDoubleArray ranks = new DiskDoubleArray(graph.rankCurrentPath(), graph.vertexCount(), graph.chunkSize(), false);
              DiskIntArray outDegree = new DiskIntArray(graph.outDegreePath(), graph.vertexCount(), graph.chunkSize(), false);
              MessagePartitionWriterManager messageWriters =
-                     new MessagePartitionWriterManager(workerDir, graph.destinationPartitionCount(), maxOpenMessageWriters)) {
+                     new MessagePartitionWriterManager(
+                             workerDir,
+                             graph.destinationPartitionCount(),
+                             graph.chunkSize(),
+                             graph.vertexCount(),
+                             maxOpenMessageWriters
+                     )) {
             Map<Integer, List<SourcePartitionSlice>> slicesByPartition = slicesBySourcePartition(work.slices());
+            double[] rankChunk = new double[graph.chunkSize()];
+            int[] outDegreeChunk = new int[graph.chunkSize()];
+            ByteBuffer rankScratch = ByteBuffer.allocate(graph.chunkSize() * Double.BYTES);
+            ByteBuffer degreeScratch = ByteBuffer.allocate(graph.chunkSize() * Integer.BYTES);
             for (Map.Entry<Integer, List<SourcePartitionSlice>> entry : slicesByPartition.entrySet()) {
                 int sourcePartition = entry.getKey();
                 long sourceStart = (long) sourcePartition * graph.chunkSize();
                 int sourceLength = chunkLength(graph, sourceStart);
-                double[] rankChunk = ranks.readChunk(sourceStart, sourceLength);
-                int[] outDegreeChunk = outDegree.readIntChunk(sourceStart, sourceLength);
+                ranks.readChunk(sourceStart, rankChunk, 0, sourceLength, rankScratch);
+                outDegree.readIntChunk(sourceStart, outDegreeChunk, 0, sourceLength, degreeScratch);
                 Path sourcePartitionPath = graph.edgesDir()
                         .resolve("src-part-%05d.bin".formatted(sourcePartition));
                 if (!Files.exists(sourcePartitionPath)) {
@@ -275,7 +286,11 @@ public final class PageRankEngine {
             ExecutorService executor
     ) throws IOException {
         Map<Integer, List<MessageFile>> messageIndex = buildMessageBucketIndex(iterationMessagesDir);
-        MessageBucketLayout bucketLayout = new MessageBucketLayout(graph.destinationPartitionCount());
+        MessageBucketLayout bucketLayout = new MessageBucketLayout(
+                graph.destinationPartitionCount(),
+                graph.chunkSize(),
+                graph.vertexCount()
+        );
         validateMessageBuckets(messageIndex, bucketLayout);
 
         List<Callable<GatherStats>> tasks = new ArrayList<>(bucketLayout.bucketCount());
@@ -299,86 +314,44 @@ public final class PageRankEngine {
             List<MessageFile> messageFiles,
             double base
     ) {
-        int firstPartition = bucketLayout.firstPartition(bucket);
-        int endPartitionExclusive = bucketLayout.endPartitionExclusive(bucket);
-        long bytes = messageFiles.stream().mapToLong(MessageFile::bytes).sum();
-        int partitionCount = endPartitionExclusive - firstPartition;
-        int splitCount = gatherSplitCount(bytes, partitionCount);
-        if (splitCount <= 1) {
-            tasks.add(() -> gatherBucketRange(
-                    graph,
-                    bucket,
-                    firstPartition,
-                    endPartitionExclusive,
-                    firstPartition,
-                    endPartitionExclusive,
-                    messageFiles,
-                    base
-            ));
-            return;
-        }
-
-        int partitionsPerSplit = Math.ceilDiv(partitionCount, splitCount);
-        for (int split = 0; split < splitCount; split++) {
-            int splitStart = firstPartition + split * partitionsPerSplit;
-            int splitEnd = Math.min(endPartitionExclusive, splitStart + partitionsPerSplit);
-            if (splitStart < splitEnd) {
-                tasks.add(() -> gatherBucketRange(
-                        graph,
-                        bucket,
-                        firstPartition,
-                        endPartitionExclusive,
-                        splitStart,
-                        splitEnd,
-                        messageFiles,
-                        base
-                ));
-            }
-        }
-    }
-
-    private int gatherSplitCount(long bytes, int partitionCount) {
-        if (bytes <= HEAVY_GATHER_BUCKET_BYTES || partitionCount <= 1) {
-            return 1;
-        }
-        long bySize = Math.ceilDiv(bytes, HEAVY_GATHER_BUCKET_BYTES);
-        return (int) Math.min(Math.min(bySize, config.threads()), partitionCount);
+        tasks.add(() -> gatherBucketRange(
+                graph,
+                bucket,
+                bucketLayout.firstDenseVertexId(bucket),
+                bucketLayout.endDenseVertexIdExclusive(bucket),
+                messageFiles,
+                base
+        ));
     }
 
     private GatherStats gatherBucketRange(
             PreprocessingResult graph,
             int bucket,
-            int bucketFirstPartition,
-            int bucketEndPartitionExclusive,
-            int rangeFirstPartition,
-            int rangeEndPartitionExclusive,
+            long rangeStart,
+            long rangeEndExclusive,
             List<MessageFile> messageFiles,
             double base
     ) throws IOException {
         long messageCount = 0;
+        int length = Math.toIntExact(rangeEndExclusive - rangeStart);
+        double[] values = new double[length];
+        Arrays.fill(values, base);
 
         try (DiskDoubleArray nextRanks = new DiskDoubleArray(graph.rankNextPath(), graph.vertexCount(), graph.chunkSize(), true, false)) {
-            GatherChunkCache chunkCache = new GatherChunkCache(graph, nextRanks, base, config.gatherChunkCacheSize());
             for (MessageFile messageFile : messageFiles) {
                 try (BinaryMessageReader reader = new BinaryMessageReader(messageFile.path())) {
                     while (reader.next()) {
                         int to = reader.to();
-                        int destinationPartition = to / graph.chunkSize();
-                        if (destinationPartition < bucketFirstPartition || destinationPartition >= bucketEndPartitionExclusive) {
-                            throw new IOException("message destination partition does not belong to bucket: bucket=%d partition=%d"
-                                    .formatted(bucket, destinationPartition));
+                        if (to < rangeStart || to >= rangeEndExclusive) {
+                            throw new IOException("message destination does not belong to bucket: bucket=%d vertex=%d range=[%d,%d)"
+                                    .formatted(bucket, to, rangeStart, rangeEndExclusive));
                         }
-                        if (destinationPartition < rangeFirstPartition || destinationPartition >= rangeEndPartitionExclusive) {
-                            continue;
-                        }
-                        CachedGatherChunk chunk = chunkCache.chunk(destinationPartition);
-                        int localTo = Math.toIntExact(to - chunk.start());
-                        chunk.values()[localTo] += reader.contribution();
+                        values[Math.toIntExact(to - rangeStart)] += reader.contribution();
                         messageCount++;
                     }
                 }
             }
-            chunkCache.flushRange(rangeFirstPartition, rangeEndPartitionExclusive);
+            nextRanks.writeChunk(rangeStart, values, length);
         }
         return new GatherStats(messageCount);
     }
@@ -558,10 +531,14 @@ public final class PageRankEngine {
         double rankSum = 0.0;
         try (DiskDoubleArray current = new DiskDoubleArray(graph.rankCurrentPath(), graph.vertexCount(), graph.chunkSize(), false);
              DiskDoubleArray next = new DiskDoubleArray(graph.rankNextPath(), graph.vertexCount(), graph.chunkSize(), false)) {
+            double[] currentChunk = new double[graph.chunkSize()];
+            double[] nextChunk = new double[graph.chunkSize()];
+            ByteBuffer currentScratch = ByteBuffer.allocate(graph.chunkSize() * Double.BYTES);
+            ByteBuffer nextScratch = ByteBuffer.allocate(graph.chunkSize() * Double.BYTES);
             for (long start = range.startId(); start < range.endIdExclusive(); start += graph.chunkSize()) {
                 int length = chunkLength(graph, start);
-                double[] currentChunk = current.readChunk(start, length);
-                double[] nextChunk = next.readChunk(start, length);
+                current.readChunk(start, currentChunk, 0, length, currentScratch);
+                next.readChunk(start, nextChunk, 0, length, nextScratch);
                 for (int i = 0; i < length; i++) {
                     l1Diff += Math.abs(nextChunk[i] - currentChunk[i]);
                     rankSum += nextChunk[i];
@@ -720,85 +697,6 @@ public final class PageRankEngine {
         FileUtils.deleteRecursively(path);
     }
 
-    private final class GatherChunkCache {
-        private final PreprocessingResult graph;
-        private final DiskDoubleArray nextRanks;
-        private final double base;
-        private final int maxChunks;
-        private final LinkedHashMap<Integer, CachedGatherChunk> chunks =
-                new LinkedHashMap<>(16, 0.75f, true);
-        private final Set<Integer> writtenPartitions = new HashSet<>();
-
-        private GatherChunkCache(PreprocessingResult graph, DiskDoubleArray nextRanks, double base, int maxChunks) {
-            this.graph = graph;
-            this.nextRanks = nextRanks;
-            this.base = base;
-            this.maxChunks = maxChunks;
-        }
-
-        private CachedGatherChunk chunk(int destinationPartition) throws IOException {
-            CachedGatherChunk cached = chunks.get(destinationPartition);
-            if (cached != null) {
-                return cached;
-            }
-            evictIfNeeded();
-            long start = (long) destinationPartition * graph.chunkSize();
-            int length = chunkLength(graph, start);
-            ByteBuffer scratch = ByteBuffer.allocate(length * Double.BYTES);
-            double[] values;
-            if (writtenPartitions.contains(destinationPartition)) {
-                values = nextRanks.readChunk(start, length, scratch);
-            } else {
-                values = new double[length];
-                Arrays.fill(values, base);
-            }
-            cached = new CachedGatherChunk(destinationPartition, start, length, values, scratch);
-            chunks.put(destinationPartition, cached);
-            return cached;
-        }
-
-        private void evictIfNeeded() throws IOException {
-            if (chunks.size() < maxChunks) {
-                return;
-            }
-            var iterator = chunks.entrySet().iterator();
-            if (iterator.hasNext()) {
-                CachedGatherChunk eldest = iterator.next().getValue();
-                write(eldest);
-                iterator.remove();
-            }
-        }
-
-        private void flushRange(int firstPartition, int endPartitionExclusive) throws IOException {
-            for (int partition = firstPartition; partition < endPartitionExclusive; partition++) {
-                CachedGatherChunk chunk = chunks.remove(partition);
-                if (chunk != null) {
-                    write(chunk);
-                } else if (!writtenPartitions.contains(partition)) {
-                    writeBaseChunk(partition);
-                }
-            }
-            for (CachedGatherChunk chunk : chunks.values()) {
-                throw new IOException("cached gather chunk outside bucket range: partition=" + chunk.partition());
-            }
-            chunks.clear();
-        }
-
-        private void write(CachedGatherChunk chunk) throws IOException {
-            nextRanks.writeChunk(chunk.start(), chunk.values(), chunk.length(), chunk.scratch());
-            writtenPartitions.add(chunk.partition());
-        }
-
-        private void writeBaseChunk(int partition) throws IOException {
-            long start = (long) partition * graph.chunkSize();
-            int length = chunkLength(graph, start);
-            double[] values = new double[length];
-            Arrays.fill(values, base);
-            nextRanks.writeChunk(start, values, length, ByteBuffer.allocate(length * Double.BYTES));
-            writtenPartitions.add(partition);
-        }
-    }
-
     public record PageRankRunResult(
             Path rankPath,
             Path verticesPath,
@@ -830,9 +728,6 @@ public final class PageRankEngine {
     }
 
     private record SourcePartitionSlice(int partition, long startByte, long bytes) {
-    }
-
-    private record CachedGatherChunk(int partition, long start, int length, double[] values, ByteBuffer scratch) {
     }
 
     private static final class SourcePartitionWorkBuilder {

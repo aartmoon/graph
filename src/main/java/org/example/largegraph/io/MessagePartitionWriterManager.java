@@ -17,9 +17,15 @@ public final class MessagePartitionWriterManager implements Closeable {
     private final Map<Integer, BinaryMessageWriter> writers;
     private final TreeSet<Integer> touchedBuckets;
 
-    public MessagePartitionWriterManager(Path workerDir, int destinationPartitionCount, int maxOpenWriters) throws IOException {
+    public MessagePartitionWriterManager(
+            Path workerDir,
+            int destinationPartitionCount,
+            int chunkSize,
+            long vertexCount,
+            int maxOpenWriters
+    ) throws IOException {
         this.workerDir = workerDir;
-        this.bucketLayout = new MessageBucketLayout(destinationPartitionCount);
+        this.bucketLayout = new MessageBucketLayout(destinationPartitionCount, chunkSize, vertexCount);
         this.maxOpenWriters = Math.max(1, maxOpenWriters);
         this.writers = new LinkedHashMap<>(16, 0.75f, true);
         this.touchedBuckets = new TreeSet<>();
@@ -27,7 +33,7 @@ public final class MessagePartitionWriterManager implements Closeable {
     }
 
     public void write(int destinationPartition, int to, double contribution) throws IOException {
-        int bucket = bucketLayout.bucketFor(destinationPartition);
+        int bucket = bucketLayout.bucketFor(destinationPartition, to);
         touchedBuckets.add(bucket);
         writerFor(bucket).write(to, contribution);
     }

@@ -7,6 +7,7 @@ import org.example.largegraph.storage.DiskIntArray;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -40,10 +41,14 @@ public final class PageRankResultWriter {
              BufferedWriter writer = Files.newBufferedWriter(config.output(), StandardCharsets.UTF_8)) {
             writer.write("vertex,rank");
             writer.newLine();
+            double[] rankChunk = new double[config.chunkSize()];
+            int[] originalIdChunk = new int[config.chunkSize()];
+            ByteBuffer rankScratch = ByteBuffer.allocate(config.chunkSize() * Double.BYTES);
+            ByteBuffer idScratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
             for (long start = 0; start < result.vertexCount(); start += config.chunkSize()) {
                 int length = (int) Math.min(config.chunkSize(), result.vertexCount() - start);
-                double[] rankChunk = ranks.readChunk(start, length);
-                int[] originalIdChunk = originalIds.readIntChunk(start, length);
+                ranks.readChunk(start, rankChunk, 0, length, rankScratch);
+                originalIds.readIntChunk(start, originalIdChunk, 0, length, idScratch);
                 for (int i = 0; i < length; i++) {
                     writer.write(Integer.toString(originalIdChunk[i]));
                     writer.write(',');
@@ -62,10 +67,14 @@ public final class PageRankResultWriter {
 
         try (DiskDoubleArray ranks = new DiskDoubleArray(result.rankPath(), result.vertexCount(), config.chunkSize(), false);
              DiskIntArray originalIds = new DiskIntArray(result.verticesPath(), result.vertexCount(), config.chunkSize(), false)) {
+            double[] rankChunk = new double[config.chunkSize()];
+            int[] originalIdChunk = new int[config.chunkSize()];
+            ByteBuffer rankScratch = ByteBuffer.allocate(config.chunkSize() * Double.BYTES);
+            ByteBuffer idScratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
             for (long start = 0; start < result.vertexCount(); start += config.chunkSize()) {
                 int length = (int) Math.min(config.chunkSize(), result.vertexCount() - start);
-                double[] rankChunk = ranks.readChunk(start, length);
-                int[] originalIdChunk = originalIds.readIntChunk(start, length);
+                ranks.readChunk(start, rankChunk, 0, length, rankScratch);
+                originalIds.readIntChunk(start, originalIdChunk, 0, length, idScratch);
                 for (int i = 0; i < length; i++) {
                     offerTopK(heap, originalIdChunk[i], rankChunk[i]);
                 }

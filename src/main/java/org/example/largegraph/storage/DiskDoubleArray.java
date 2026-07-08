@@ -48,15 +48,32 @@ public final class DiskDoubleArray implements Closeable {
 
     public double[] readChunk(long startId, int requestedLength, ByteBuffer scratch) throws IOException {
         validateRange(startId, requestedLength);
-        ensureScratchCapacity(scratch, requestedLength);
         double[] values = new double[requestedLength];
+        readChunk(startId, values, 0, requestedLength, scratch);
+        return values;
+    }
+
+    public void readChunk(long startId, double[] target, int targetOffset, int requestedLength) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
+        readChunk(startId, target, targetOffset, requestedLength, buffer);
+    }
+
+    public void readChunk(
+            long startId,
+            double[] target,
+            int targetOffset,
+            int requestedLength,
+            ByteBuffer scratch
+    ) throws IOException {
+        validateRange(startId, requestedLength);
+        validateTarget(target.length, targetOffset, requestedLength);
+        ensureScratchCapacity(scratch, requestedLength);
         ByteBuffer buffer = prepareScratch(scratch, requestedLength);
         readFully(buffer, startId * BYTES);
         buffer.flip();
         for (int i = 0; i < requestedLength; i++) {
-            values[i] = buffer.getDouble();
+            target[targetOffset + i] = buffer.getDouble();
         }
-        return values;
     }
 
     public void writeChunk(long startId, double[] values, int requestedLength) throws IOException {
@@ -125,6 +142,13 @@ public final class DiskDoubleArray implements Closeable {
     private void ensureWritable() {
         if (!writable) {
             throw new IllegalStateException("disk array is opened read-only: " + path);
+        }
+    }
+
+    private void validateTarget(int targetLength, int targetOffset, int requestedLength) {
+        if (targetOffset < 0 || requestedLength < 0 || targetOffset + requestedLength > targetLength) {
+            throw new IllegalArgumentException("invalid target range: offset=%d length=%d targetLength=%d"
+                    .formatted(targetOffset, requestedLength, targetLength));
         }
     }
 
