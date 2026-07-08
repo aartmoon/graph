@@ -2,7 +2,6 @@ package org.example.largegraph.graph;
 
 import org.example.largegraph.config.AppConfig;
 import org.example.largegraph.io.BinaryEdgeReader;
-import org.example.largegraph.io.BinaryEdgeReader.DenseEdge;
 import org.example.largegraph.io.CsvEdgeReader;
 import org.example.largegraph.io.CsvEdgeReader.Edge;
 import org.example.largegraph.io.SourcePartitionWriterManager;
@@ -226,9 +225,8 @@ public final class GraphPreprocessor {
                 }
 
                 try (BinaryEdgeReader edgeReader = new BinaryEdgeReader(sourcePartitionPath)) {
-                    Optional<DenseEdge> edge;
-                    while ((edge = edgeReader.next()).isPresent()) {
-                        int localFrom = Math.toIntExact(edge.get().denseFrom() - sourceStart);
+                    while (edgeReader.next()) {
+                        int localFrom = Math.toIntExact(edgeReader.denseFrom() - sourceStart);
                         outDegreeChunk[localFrom]++;
                     }
                 }

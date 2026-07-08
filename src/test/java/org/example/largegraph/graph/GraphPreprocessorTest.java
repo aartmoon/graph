@@ -131,6 +131,7 @@ final class GraphPreprocessorTest {
                 1e-8,
                 AppConfig.IdMode.CONTIGUOUS,
                 0,
+                8,
                 false
         );
     }

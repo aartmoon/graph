@@ -183,13 +183,20 @@ public final class DiskIntArray implements Closeable {
             if (read < 0) {
                 throw new IOException("unexpected EOF while reading " + path);
             }
+            if (read == 0) {
+                throw new IOException("zero-byte read while reading " + path);
+            }
             position += read;
         }
     }
 
     private synchronized void writeFully(ByteBuffer buffer, long position) throws IOException {
         while (buffer.hasRemaining()) {
-            position += channel.write(buffer, position);
+            int written = channel.write(buffer, position);
+            if (written == 0) {
+                throw new IOException("zero-byte write while writing " + path);
+            }
+            position += written;
         }
     }
 

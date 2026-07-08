@@ -11,19 +11,15 @@ import java.util.Map;
 import java.util.TreeSet;
 
 public final class MessagePartitionWriterManager implements Closeable {
-    private static final int MAX_MESSAGE_BUCKETS = 8_192;
-
     private final Path workerDir;
-    private final int destinationPartitionCount;
-    private final int bucketCount;
+    private final MessageBucketLayout bucketLayout;
     private final int maxOpenWriters;
     private final Map<Integer, BinaryMessageWriter> writers;
     private final TreeSet<Integer> touchedBuckets;
 
     public MessagePartitionWriterManager(Path workerDir, int destinationPartitionCount, int maxOpenWriters) throws IOException {
         this.workerDir = workerDir;
-        this.destinationPartitionCount = destinationPartitionCount;
-        this.bucketCount = Math.max(1, Math.min(destinationPartitionCount, MAX_MESSAGE_BUCKETS));
+        this.bucketLayout = new MessageBucketLayout(destinationPartitionCount);
         this.maxOpenWriters = Math.max(1, maxOpenWriters);
         this.writers = new LinkedHashMap<>(16, 0.75f, true);
         this.touchedBuckets = new TreeSet<>();
@@ -31,10 +27,7 @@ public final class MessagePartitionWriterManager implements Closeable {
     }
 
     public void write(int destinationPartition, int to, double contribution) throws IOException {
-        if (destinationPartition < 0 || destinationPartition >= destinationPartitionCount) {
-            throw new IllegalArgumentException("invalid destination partition: " + destinationPartition);
-        }
-        int bucket = bucketFor(destinationPartition);
+        int bucket = bucketLayout.bucketFor(destinationPartition);
         touchedBuckets.add(bucket);
         writerFor(bucket).write(to, contribution);
     }
@@ -52,10 +45,6 @@ public final class MessagePartitionWriterManager implements Closeable {
         writer = new BinaryMessageWriter(pathFor(bucket));
         writers.put(bucket, writer);
         return writer;
-    }
-
-    private int bucketFor(int destinationPartition) {
-        return destinationPartition % bucketCount;
     }
 
     private void evictIfNeeded() throws IOException {

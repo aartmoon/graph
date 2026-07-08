@@ -21,6 +21,7 @@ final class ArgsParserTest {
         assertEquals(1e-8, config.epsilon());
         assertEquals(AppConfig.IdMode.CONTIGUOUS, config.idMode());
         assertEquals(0, config.topK());
+        assertEquals(16, config.gatherChunkCacheSize());
         assertFalse(config.keepMessages());
     }
 
@@ -39,6 +40,7 @@ final class ArgsParserTest {
         assertEquals(1e-8, config.epsilon());
         assertEquals(AppConfig.IdMode.CONTIGUOUS, config.idMode());
         assertEquals(0, config.topK());
+        assertEquals(8, config.gatherChunkCacheSize());
         assertFalse(config.keepMessages());
     }
 
@@ -75,6 +77,7 @@ final class ArgsParserTest {
                 "--epsilon", "1e-8",
                 "--id-mode", "contiguous",
                 "--top-k", "0",
+                "--gather-chunk-cache-size", "16",
                 "--keep-messages", "false"
         };
     }

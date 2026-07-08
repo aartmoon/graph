@@ -179,6 +179,7 @@ final class PageRankEngineTest {
                 1e-10,
                 AppConfig.IdMode.CONTIGUOUS,
                 0,
+                8,
                 false
         );
         GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();

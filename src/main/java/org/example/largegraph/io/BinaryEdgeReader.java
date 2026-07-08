@@ -7,30 +7,43 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Optional;
 
 public final class BinaryEdgeReader implements Closeable {
+    private static final int RECORD_BYTES = Integer.BYTES * 2;
+
     private final DataInputStream input;
+    private int denseFrom;
+    private int denseTo;
 
     public BinaryEdgeReader(Path path) throws IOException {
+        long bytes = Files.size(path);
+        if (bytes % RECORD_BYTES != 0) {
+            throw new IOException("corrupted edge file size: %s bytes=%d recordBytes=%d"
+                    .formatted(path, bytes, RECORD_BYTES));
+        }
         this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
     }
 
-    public Optional<DenseEdge> next() throws IOException {
+    public boolean next() throws IOException {
         try {
-            int denseFrom = input.readInt();
-            int denseTo = input.readInt();
-            return Optional.of(new DenseEdge(denseFrom, denseTo));
+            denseFrom = input.readInt();
+            denseTo = input.readInt();
+            return true;
         } catch (EOFException ex) {
-            return Optional.empty();
+            return false;
         }
+    }
+
+    public int denseFrom() {
+        return denseFrom;
+    }
+
+    public int denseTo() {
+        return denseTo;
     }
 
     @Override
     public void close() throws IOException {
         input.close();
-    }
-
-    public record DenseEdge(int denseFrom, int denseTo) {
     }
 }

@@ -17,6 +17,7 @@ public final class ArgsParser {
             "--epsilon",
             "--id-mode",
             "--top-k",
+            "--gather-chunk-cache-size",
             "--keep-messages"
     );
 
@@ -25,6 +26,7 @@ public final class ArgsParser {
     private static final double DEFAULT_EPSILON = 1e-8;
     private static final AppConfig.IdMode DEFAULT_ID_MODE = AppConfig.IdMode.CONTIGUOUS;
     private static final int DEFAULT_TOP_K = 0;
+    private static final int DEFAULT_GATHER_CHUNK_CACHE_SIZE = 8;
     private static final boolean DEFAULT_KEEP_MESSAGES = false;
 
     private ArgsParser() {
@@ -45,6 +47,7 @@ public final class ArgsParser {
                 parseDouble(values, "--epsilon", DEFAULT_EPSILON),
                 values.containsKey("--id-mode") ? AppConfig.IdMode.fromCliValue(values.get("--id-mode")) : DEFAULT_ID_MODE,
                 parseNonNegativeInt(values, "--top-k", DEFAULT_TOP_K),
+                parsePositiveInt(values, "--gather-chunk-cache-size", DEFAULT_GATHER_CHUNK_CACHE_SIZE),
                 parseBoolean(values, "--keep-messages", DEFAULT_KEEP_MESSAGES)
         );
     }
@@ -63,6 +66,7 @@ public final class ArgsParser {
                     --epsilon 1e-8 \\
                     --id-mode contiguous \\
                     --top-k 0 \\
+                    --gather-chunk-cache-size 8 \\
                     --keep-messages false
                 """;
     }

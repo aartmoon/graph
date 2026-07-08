@@ -52,12 +52,16 @@ public final class Main {
     private static void warnIfChunkSizeLooksRisky(AppConfig config, ProgressLogger logger) {
         long activeTasks = Math.max(1, config.threads());
         long pagerankChunkEstimate = safeMultiply(safeMultiply(config.chunkSize(), 64L), activeTasks);
+        long gatherCacheEstimate = safeMultiply(
+                safeMultiply(config.chunkSize(), (long) Double.BYTES),
+                safeMultiply(config.gatherChunkCacheSize(), activeTasks)
+        );
         long intSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK), Integer.BYTES);
         long recordSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_RECORD_SORT_CHUNK), 32L);
         long topKEstimate = safeMultiply(config.topK(), 32L);
         long maxHeap = MemoryUtils.maxHeapBytes();
         long largestEstimate = Math.max(
-                Math.max(pagerankChunkEstimate, topKEstimate),
+                Math.max(Math.max(pagerankChunkEstimate, gatherCacheEstimate), topKEstimate),
                 Math.max(intSortChunkEstimate, recordSortChunkEstimate)
         );
         if (largestEstimate > maxHeap / 2) {
@@ -65,6 +69,7 @@ public final class Main {
                     WARNING memory configuration may be risky:
                       maxHeap=%s
                       pagerankChunkEstimate=%s
+                      gatherCacheEstimate=%s
                       intSortChunkEstimate=%s
                       recordSortChunkEstimate=%s
                       topKEstimate=%s
@@ -72,6 +77,7 @@ public final class Main {
                     .formatted(
                             MemoryUtils.humanReadableBytes(maxHeap),
                             MemoryUtils.humanReadableBytes(pagerankChunkEstimate),
+                            MemoryUtils.humanReadableBytes(gatherCacheEstimate),
                             MemoryUtils.humanReadableBytes(intSortChunkEstimate),
                             MemoryUtils.humanReadableBytes(recordSortChunkEstimate),
                             MemoryUtils.humanReadableBytes(topKEstimate)

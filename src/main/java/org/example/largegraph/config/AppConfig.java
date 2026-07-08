@@ -13,6 +13,7 @@ public record AppConfig(
         double epsilon,
         IdMode idMode,
         int topK,
+        int gatherChunkCacheSize,
         boolean keepMessages
 ) {
     public static final int MAX_TOP_K = 1_000_000;
@@ -50,6 +51,9 @@ public record AppConfig(
         }
         if (topK > MAX_TOP_K) {
             throw new IllegalArgumentException("--top-k must be <= " + MAX_TOP_K);
+        }
+        if (gatherChunkCacheSize <= 0) {
+            throw new IllegalArgumentException("--gather-chunk-cache-size must be positive");
         }
     }
 

@@ -22,7 +22,8 @@ from,to
 - disk-backed `DiskDoubleArray` и `DiskIntArray`;
 - preprocessing без random disk increment на каждое исходное ребро;
 - message manifest вместо проверки всех `workers * partitions` файлов;
-- балансировка scatter/gather через очередь задач с тяжелыми partitions первыми;
+- message buckets покрывают непрерывные диапазоны destination partitions;
+- балансировка scatter/gather через очередь задач с тяжелыми slices/buckets первыми;
 - потоковый output и `--top-k` через heap размера K.
 
 Реализация остается специализированной под PageRank, а не превращается в общий graph framework.
@@ -176,16 +177,18 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 - slices greedily раскладываются в `threads` worker buckets, чтобы тяжелая partition не закреплялась целиком за одним worker;
 - один worker bucket пишет в одну worker directory;
 - task читает только `rankChunk` и `outDegreeChunk` своего source chunk;
-- messages пишутся в worker directory в bounded destination buckets (`<= 8192` buckets на worker), а не в отдельный файл на каждую destination partition.
+- messages пишутся в worker directory в bounded destination buckets (`<= 8192` buckets на worker), а не в отдельный файл на каждую destination partition;
+- bucket соответствует непрерывному диапазону destination partitions, поэтому gather читает и пишет rank chunks локальнее.
 
 Фаза 2, gather:
 
 - каждый worker пишет `manifest.txt` со списком только реально созданных message buckets;
 - gather строит bucket index из manifest-файлов;
-- `rank_next.bin` сначала sequentially заполняется base value для всех partitions;
-- task создается только для touched message buckets;
-- touched buckets сортируются по суммарным message bytes по убыванию;
+- task создается для каждого непустого диапазона message bucket layout, включая buckets без messages, чтобы каждый destination chunk был перезаписан на итерации;
+- buckets сортируются по суммарным message bytes по убыванию;
 - task открывает свой `DiskDoubleArray` для `rank_next.bin` и держит bounded LRU cache destination chunks;
+- chunk впервые инициализируется base value внутри gather task, отдельного полного прохода заполнения `rank_next.bin` нет;
+- размер LRU cache задается через `--gather-chunk-cache-size`;
 - `Files.exists` для всех `workers * partitions` не выполняется.
 
 Фаза 3, convergence:
@@ -193,7 +196,7 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 - `rank_current.bin` и `rank_next.bin` читаются chunk-ами;
 - считается `l1Diff` и `rankSum`;
 - если `abs(rankSum - 1.0) > 1e-6`, пишется warning;
-- rank files меняются местами через rename;
+- rank files меняются местами через safer rename sequence с временным файлом и попыткой rollback;
 - messages удаляются после итерации, если `--keep-messages false`.
 
 ## Output
@@ -245,7 +248,7 @@ int sort chunk <= 500000 ids
 endpoint record sort chunk <= 250000 records
 ```
 
-Runtime warning остается advisory и отдельно показывает `pagerankChunkEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate`, `topKEstimate` и `maxHeap`; это не полноценный memory planner.
+Runtime warning остается advisory и отдельно показывает `pagerankChunkEstimate`, `gatherCacheEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate`, `topKEstimate` и `maxHeap`; это не полноценный memory planner.
 
 В heap не хранятся:
 
@@ -342,6 +345,7 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
   --epsilon 1e-8 \
   --id-mode contiguous \
   --top-k 0 \
+  --gather-chunk-cache-size 8 \
   --keep-messages false
 ```
 
@@ -383,5 +387,6 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 - preprocessing может требовать несколько размеров исходного edge storage во временном диске;
 - compression/checkpoint/resume пока нет;
 - recursive cleanup использует streaming `walkFileTree`, без materialization всех paths в heap;
+- binary readers валидируют кратность file size record size и не проглатывают partial records;
 - `DiskDoubleArray` и `DiskIntArray` используют synchronized positional writes внутри одного handle; parallel gather открывает independent handles для непересекающихся destination ranges;
 - очень маленький граф или один небольшой source slice не сможет загрузить все CPU независимо от `--threads`.

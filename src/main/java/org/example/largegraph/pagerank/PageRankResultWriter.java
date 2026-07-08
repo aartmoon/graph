@@ -65,7 +65,7 @@ public final class PageRankResultWriter {
                 double[] rankChunk = ranks.readChunk(start, length);
                 int[] originalIdChunk = originalIds.readIntChunk(start, length);
                 for (int i = 0; i < length; i++) {
-                    offerTopK(heap, new RankEntry(originalIdChunk[i], rankChunk[i]));
+                    offerTopK(heap, originalIdChunk[i], rankChunk[i]);
                 }
             }
         }
@@ -88,9 +88,9 @@ public final class PageRankResultWriter {
         }
     }
 
-    private void offerTopK(PriorityQueue<RankEntry> heap, RankEntry candidate) {
+    private void offerTopK(PriorityQueue<RankEntry> heap, int vertex, double rank) {
         if (heap.size() < config.topK()) {
-            heap.add(candidate);
+            heap.add(new RankEntry(vertex, rank));
             return;
         }
 
@@ -98,10 +98,10 @@ public final class PageRankResultWriter {
         if (weakest == null) {
             return;
         }
-        if (candidate.rank() > weakest.rank()
-                || (candidate.rank() == weakest.rank() && candidate.vertex() < weakest.vertex())) {
+        if (rank > weakest.rank()
+                || (rank == weakest.rank() && vertex < weakest.vertex())) {
             heap.poll();
-            heap.add(candidate);
+            heap.add(new RankEntry(vertex, rank));
         }
     }
 
