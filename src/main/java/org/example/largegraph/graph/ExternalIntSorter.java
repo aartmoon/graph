@@ -134,9 +134,15 @@ public final class ExternalIntSorter {
                 }
             }
 
+            boolean haveLast = false;
+            int last = 0;
             while (!queue.isEmpty()) {
                 IntCursor cursor = queue.poll();
-                writer.write(cursor.value());
+                if (!haveLast || cursor.value() != last) {
+                    writer.write(cursor.value());
+                    last = cursor.value();
+                    haveLast = true;
+                }
 
                 OptionalInt next = readers.get(cursor.runId()).next();
                 if (next.isPresent()) {

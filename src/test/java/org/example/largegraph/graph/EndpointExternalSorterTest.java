@@ -79,6 +79,35 @@ final class EndpointExternalSorterTest {
         assertEquals(expected, readEndpointAssignments(output));
     }
 
+    @Test
+    void denseEdgeSorterOrdersAndDeduplicatesPrimitiveRunsAndMergePasses() throws IOException {
+        Path input = tempDir.resolve("dense_edges.bin");
+        Path output = tempDir.resolve("dense_edges.sorted.bin");
+        List<DenseEdgeRecord> records = new ArrayList<>();
+        for (int i = 99; i >= 0; i--) {
+            records.add(new DenseEdgeRecord(i % 13, i % 7));
+        }
+        records.add(new DenseEdgeRecord(1, 2));
+        records.add(new DenseEdgeRecord(1, 2));
+        records.add(new DenseEdgeRecord(1, 1));
+        writeDenseEdges(input, records);
+
+        new DenseEdgeExternalSorter(1).sortUnique(
+                input,
+                output,
+                tempDir.resolve("sort").resolve("dense-edges"),
+                "dense-edge-run"
+        );
+
+        List<DenseEdgeRecord> expected = records.stream()
+                .distinct()
+                .sorted(Comparator
+                        .comparingInt(DenseEdgeRecord::from)
+                        .thenComparingInt(DenseEdgeRecord::to))
+                .toList();
+        assertEquals(expected, readDenseEdges(output));
+    }
+
     private static void writeEndpointRefs(Path path, List<EndpointRefRecord> records) throws IOException {
         try (DataOutputStream output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)))) {
             for (EndpointRefRecord record : records) {
@@ -125,9 +154,34 @@ final class EndpointExternalSorterTest {
         }
     }
 
+    private static void writeDenseEdges(Path path, List<DenseEdgeRecord> records) throws IOException {
+        try (DataOutputStream output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)))) {
+            for (DenseEdgeRecord record : records) {
+                output.writeInt(record.from());
+                output.writeInt(record.to());
+            }
+        }
+    }
+
+    private static List<DenseEdgeRecord> readDenseEdges(Path path) throws IOException {
+        List<DenseEdgeRecord> records = new ArrayList<>();
+        try (DataInputStream input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)))) {
+            while (true) {
+                try {
+                    records.add(new DenseEdgeRecord(input.readInt(), input.readInt()));
+                } catch (EOFException ex) {
+                    return records;
+                }
+            }
+        }
+    }
+
     private record EndpointRefRecord(int originalId, long edgeId, byte side) {
     }
 
     private record EndpointAssignmentRecord(long edgeId, byte side, int denseId) {
+    }
+
+    private record DenseEdgeRecord(int from, int to) {
     }
 }

@@ -23,6 +23,7 @@ from,to
 - preprocessing без random disk increment на каждое исходное ребро;
 - message manifest вместо проверки всех `workers * partitions` файлов;
 - message buckets покрывают непрерывные диапазоны destination partitions;
+- heavy gather buckets могут делиться на непересекающиеся destination subranges;
 - балансировка scatter/gather через очередь задач с тяжелыми slices/buckets первыми;
 - потоковый output и `--top-k` через heap размера K.
 
@@ -165,7 +166,7 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 Фаза 0, dangling mass:
 
 - `rank_current.bin` и `out_degree.bin` читаются chunk-ами;
-- chunks обрабатываются параллельно и затем reduce-ятся в общий dangling mass;
+- chunks обрабатываются параллельно worker ranges и затем reduce-ятся в общий dangling mass;
 - полный `rank[]` или `outDegree[]` в heap не загружается.
 
 Фаза 1, scatter:
@@ -184,6 +185,7 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 - каждый worker пишет `manifest.txt` со списком только реально созданных message buckets;
 - gather строит bucket index из manifest-файлов;
 - task создается для каждого непустого диапазона message bucket layout, включая buckets без messages, чтобы каждый destination chunk был перезаписан на итерации;
+- heavy bucket (`> 64 MiB`) делится на несколько destination subrange tasks; subrange tasks пишут непересекающиеся rank chunks;
 - buckets сортируются по суммарным message bytes по убыванию;
 - task открывает свой `DiskDoubleArray` для `rank_next.bin` и держит bounded LRU cache destination chunks;
 - chunk впервые инициализируется base value внутри gather task, отдельного полного прохода заполнения `rank_next.bin` нет;
@@ -193,7 +195,7 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 Фаза 3, convergence:
 
 - `rank_current.bin` и `rank_next.bin` читаются chunk-ами;
-- chunks обрабатываются параллельно, затем считается общий `l1Diff` и `rankSum`;
+- chunks обрабатываются параллельно worker ranges, затем считается общий `l1Diff` и `rankSum`;
 - если `abs(rankSum - 1.0) > 1e-6`, пишется warning;
 - rank files меняются местами через safer rename sequence с временным файлом и попыткой rollback;
 - messages удаляются после итерации, если `--keep-messages false`.
@@ -246,6 +248,8 @@ External sort chunks имеют internal caps отдельно от PageRank `ch
 int sort chunk <= 500000 ids
 endpoint record sort chunk <= 250000 records
 ```
+
+Vertex id sort dedup-ит значения уже внутри sorted runs и во время intermediate merge. Dense edges сортируются primitive sorter-ом по `(denseFrom, denseTo)` и dedup-ятся во время merge.
 
 Runtime warning остается advisory и отдельно показывает `scatterEstimate`, `gatherCacheEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate`, `topKEstimate` и `maxHeap`; это не полноценный memory planner.
 
@@ -352,11 +356,11 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 
 Пример smoke benchmark на synthetic graph с фиксированным seed:
 
-| Dataset | V | input E | stored E | heap | chunk-size | threads | iterations | rankSum |
-| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| synthetic-hyper seed=42 | 50,000 | 300,000 | около 300,000 после dedup | `-Xmx128m` | 10,000 | 4 | 3 | около 1.0 |
+| Dataset | V | input E | stored E | heap | chunk-size | threads | iterations | time | workdir | output | rankSum |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| synthetic-hyper seed=42 | 50,000 | 300,000 | 299,986 | `-Xmx128m` | 10,000 | 4 | 3 | 1.03s | 3.5 MiB | 1.3 MiB | 1.000000000000001 |
 
-Точный wall-clock time и max disk зависят от SSD/OS cache, поэтому фиксируются в локальном run log, а `*.meta.json` рядом с output сохраняет `vertices`, `edges`, `iterations`, `status`, `lastDelta`, `rankSum`, `damping`, `chunkSize`, `threads`.
+`usedHeap` в логах — это Java heap, а не полный RSS процесса. Wall-clock time зависит от SSD/OS cache, но `*.meta.json` рядом с output сохраняет `vertices`, `edges`, `iterations`, `status`, `lastDelta`, `rankSum`, `damping`, `chunkSize`, `threads`.
 
 Полный пример:
 
@@ -406,7 +410,7 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 ## Ограничения
 
 - external sort implementation простой: chunk sort + k-way merge;
-- hot-path sort для endpoint refs/assignments использует primitive arrays, generic record sorter оставлен как fallback;
+- hot-path sort для endpoint refs/assignments/dense edges использует primitive arrays, generic record sorter оставлен как fallback;
 - sort run metadata bounded: при превышении merge fan-in runs инкрементально compact-ятся;
 - preprocessing делает несколько disk passes;
 - preprocessing intermediate files удаляются после построения persistent graph storage;

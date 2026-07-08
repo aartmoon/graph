@@ -20,7 +20,6 @@ import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
@@ -152,12 +151,7 @@ public final class GraphPreprocessor {
         writeDenseEdges();
 
         logger.info("Sorting and deduplicating dense edges");
-        new ExternalRecordSorter<>(
-                DenseEdgeReader::new,
-                DenseEdgeWriter::new,
-                Comparator.comparingInt(DenseEdge::from).thenComparingInt(DenseEdge::to),
-                recordSortChunkSize()
-        ).sort(
+        new DenseEdgeExternalSorter(recordSortChunkSize()).sortUnique(
                 denseEdgesPath(),
                 denseEdgesSortedPath(),
                 config.workDir().resolve("sort").resolve("dense-edges"),
@@ -219,7 +213,6 @@ public final class GraphPreprocessor {
     private long writeDenseSourcePartitions(int partitionCount) throws IOException {
         int maxOpenWriters = Math.min(partitionCount, MAX_TOTAL_SOURCE_PARTITION_WRITERS);
         long edgeCount = 0;
-        DenseEdge previous = null;
 
         try (DenseEdgeReader reader = new DenseEdgeReader(denseEdgesSortedPath());
              SourcePartitionWriterManager writerManager =
@@ -227,12 +220,8 @@ public final class GraphPreprocessor {
             Optional<DenseEdge> edge;
             while ((edge = reader.next()).isPresent()) {
                 DenseEdge current = edge.get();
-                if (previous != null && previous.from() == current.from() && previous.to() == current.to()) {
-                    continue;
-                }
                 int sourcePartition = current.from() / config.chunkSize();
                 writerManager.write(sourcePartition, current.from(), current.to());
-                previous = current;
                 edgeCount++;
                 logProgress("dense-dedup-write", edgeCount);
             }
@@ -244,17 +233,36 @@ public final class GraphPreprocessor {
         int taskCount = Math.min(config.threads(), Math.max(1, partitionCount));
         ExecutorService executor = Executors.newFixedThreadPool(taskCount);
         try {
-            List<Callable<Void>> tasks = new ArrayList<>(partitionCount);
-            for (int sourcePartition = 0; sourcePartition < partitionCount; sourcePartition++) {
-                int partition = sourcePartition;
+            List<PartitionRange> ranges = partitionRanges(partitionCount, taskCount);
+            List<Callable<Void>> tasks = new ArrayList<>(ranges.size());
+            for (PartitionRange range : ranges) {
                 tasks.add(() -> {
-                    buildOutDegreeForSourcePartition(vertexCount, partition);
+                    buildOutDegreeForSourcePartitionRange(vertexCount, range);
                     return null;
                 });
             }
             invokeAll(executor, tasks);
         } finally {
             shutdown(executor);
+        }
+    }
+
+    private List<PartitionRange> partitionRanges(int partitionCount, int rangeCount) {
+        List<PartitionRange> ranges = new ArrayList<>(rangeCount);
+        int partitionsPerRange = Math.ceilDiv(partitionCount, rangeCount);
+        for (int range = 0; range < rangeCount; range++) {
+            int start = range * partitionsPerRange;
+            int end = Math.min(partitionCount, start + partitionsPerRange);
+            if (start < end) {
+                ranges.add(new PartitionRange(start, end));
+            }
+        }
+        return ranges;
+    }
+
+    private void buildOutDegreeForSourcePartitionRange(long vertexCount, PartitionRange range) throws IOException {
+        for (int sourcePartition = range.startPartition(); sourcePartition < range.endPartitionExclusive(); sourcePartition++) {
+            buildOutDegreeForSourcePartition(vertexCount, sourcePartition);
         }
     }
 
@@ -471,6 +479,9 @@ public final class GraphPreprocessor {
     }
 
     private record FirstPassStats(long edgeCount) {
+    }
+
+    private record PartitionRange(int startPartition, int endPartitionExclusive) {
     }
 
     public record PreprocessingResult(
