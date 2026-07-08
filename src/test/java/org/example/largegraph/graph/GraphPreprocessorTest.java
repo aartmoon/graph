@@ -131,14 +131,18 @@ final class GraphPreprocessorTest {
     }
 
     @Test
-    void rejectsNegativeVertexIdsInContiguousMode() throws IOException {
+    void supportsNegativeOriginalVertexIds() throws IOException {
         Path input = tempDir.resolve("edges.csv");
         Files.writeString(input, "from,to\n-1,2\n");
 
         AppConfig config = config(input, tempDir.resolve("out.csv"), tempDir.resolve("work"), 4, 2);
+        GraphPreprocessor.PreprocessingResult result = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
 
-        assertThrows(IllegalArgumentException.class,
-                () -> new GraphPreprocessor(config, new ProgressLogger()).preprocess());
+        assertEquals(2, result.vertexCount());
+        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), result.chunkSize())) {
+            assertEquals(-1, vertices.getInt(0));
+            assertEquals(2, vertices.getInt(1));
+        }
     }
 
     @Test

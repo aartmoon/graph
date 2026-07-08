@@ -19,9 +19,17 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 public final class GraphPreprocessor {
     private static final long PROGRESS_INTERVAL_EDGES = 1_000_000L;
@@ -88,8 +96,6 @@ public final class GraphPreprocessor {
             while (reader.next()) {
                 int from = reader.from();
                 int to = reader.to();
-                validateVertexId(from);
-                validateVertexId(to);
                 endpointRefs.write(new EndpointRef(from, edgeCount, (byte) 0));
                 endpointRefs.write(new EndpointRef(to, edgeCount, (byte) 1));
                 vertexIds.write(from);
@@ -235,25 +241,39 @@ public final class GraphPreprocessor {
     }
 
     private void buildOutDegreeBySourcePartition(long vertexCount, int partitionCount) throws IOException {
-        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize())) {
+        int taskCount = Math.min(config.threads(), Math.max(1, partitionCount));
+        ExecutorService executor = Executors.newFixedThreadPool(taskCount);
+        try {
+            List<Callable<Void>> tasks = new ArrayList<>(partitionCount);
             for (int sourcePartition = 0; sourcePartition < partitionCount; sourcePartition++) {
-                long sourceStart = (long) sourcePartition * config.chunkSize();
-                int sourceLength = (int) Math.min(config.chunkSize(), vertexCount - sourceStart);
-                int[] outDegreeChunk = new int[sourceLength];
-                Path sourcePartitionPath = edgesDir().resolve("src-part-%05d.bin".formatted(sourcePartition));
-                if (!Files.exists(sourcePartitionPath)) {
-                    continue;
-                }
-
-                try (BinaryEdgeReader edgeReader = new BinaryEdgeReader(sourcePartitionPath)) {
-                    while (edgeReader.next()) {
-                        int localFrom = Math.toIntExact(edgeReader.denseFrom() - sourceStart);
-                        outDegreeChunk[localFrom]++;
-                    }
-                }
-                outDegree.writeIntChunk(sourceStart, outDegreeChunk, sourceLength);
+                int partition = sourcePartition;
+                tasks.add(() -> {
+                    buildOutDegreeForSourcePartition(vertexCount, partition);
+                    return null;
+                });
             }
-            outDegree.flush();
+            invokeAll(executor, tasks);
+        } finally {
+            shutdown(executor);
+        }
+    }
+
+    private void buildOutDegreeForSourcePartition(long vertexCount, int sourcePartition) throws IOException {
+        long sourceStart = (long) sourcePartition * config.chunkSize();
+        int sourceLength = (int) Math.min(config.chunkSize(), vertexCount - sourceStart);
+        int[] outDegreeChunk = new int[sourceLength];
+        Path sourcePartitionPath = edgesDir().resolve("src-part-%05d.bin".formatted(sourcePartition));
+        if (Files.exists(sourcePartitionPath)) {
+            try (BinaryEdgeReader edgeReader = new BinaryEdgeReader(sourcePartitionPath)) {
+                while (edgeReader.next()) {
+                    int localFrom = Math.toIntExact(edgeReader.denseFrom() - sourceStart);
+                    outDegreeChunk[localFrom]++;
+                }
+            }
+        }
+
+        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize())) {
+            outDegree.writeIntChunk(sourceStart, outDegreeChunk, sourceLength);
         }
     }
 
@@ -293,12 +313,6 @@ public final class GraphPreprocessor {
 
     private int intSortChunkSize() {
         return Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK);
-    }
-
-    private void validateVertexId(int vertexId) {
-        if (vertexId < 0) {
-            throw new IllegalArgumentException("negative vertex id: " + vertexId);
-        }
     }
 
     private void prepareWorkDir() throws IOException {
@@ -414,6 +428,41 @@ public final class GraphPreprocessor {
     private void logProgress(String phase, long edgeCount) {
         if (edgeCount % PROGRESS_INTERVAL_EDGES == 0) {
             logger.info("%s processed %,d edges".formatted(phase, edgeCount));
+        }
+    }
+
+    private <T> List<T> invokeAll(ExecutorService executor, List<Callable<T>> tasks) throws IOException {
+        try {
+            List<Future<T>> futures = executor.invokeAll(tasks);
+            List<T> results = new ArrayList<>(futures.size());
+            for (Future<T> future : futures) {
+                results.add(future.get());
+            }
+            return results;
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("preprocessing was interrupted", ex);
+        } catch (ExecutionException ex) {
+            Throwable cause = ex.getCause();
+            if (cause instanceof IOException ioException) {
+                throw ioException;
+            }
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            throw new IOException("preprocessing task failed", cause);
+        }
+    }
+
+    private void shutdown(ExecutorService executor) {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            executor.shutdownNow();
         }
     }
 

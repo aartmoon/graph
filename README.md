@@ -14,7 +14,7 @@ from,to
 ## Главное
 
 - Java 21 + Gradle;
-- arbitrary non-negative `int32` original ids;
+- arbitrary `int32` original ids;
 - external dense reindexing в диапазон `[0..V)`;
 - PageRank считает по dense ids, output пишет original ids;
 - source-partitioned edges;
@@ -27,6 +27,12 @@ from,to
 - потоковый output и `--top-k` через heap размера K.
 
 Реализация остается специализированной под PageRank, а не превращается в общий graph framework.
+
+## Рассмотренные варианты
+
+1. In-memory CSR / adjacency list. Самый быстрый вариант для умеренных графов, но отклонен: хранит adjacency и rank/outDegree массивы в RAM и плохо подходит под условие, где граф не помещается в heap.
+2. GraphChi-style sliding shards. Хороший external-memory вариант с сильной locality, но сложнее в реализации: нужно строить shards, аккуратно вести updates и поддерживать more involved scheduler.
+3. X-Stream-style scatter/gather + source partitions. Выбранный вариант: простой, streaming-friendly, устойчив к sparse ids и гипер-узлам, хорошо ложится на PageRank и держит heap bounded by chunk/cache sizes.
 
 ## PageRank
 
@@ -97,7 +103,7 @@ from,to,weight,comment
 - пробелы вокруг ids обрезаются;
 - если в строке меньше двух колонок, preprocessing завершится понятной ошибкой;
 - если первые две колонки не являются `int32`, preprocessing завершится понятной ошибкой;
-- отрицательные ids отклоняются.
+- отрицательные `int32` ids разрешены и получают обычные dense ids.
 
 ## Storage Layout
 
@@ -159,6 +165,7 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 Фаза 0, dangling mass:
 
 - `rank_current.bin` и `out_degree.bin` читаются chunk-ами;
+- chunks обрабатываются параллельно и затем reduce-ятся в общий dangling mass;
 - полный `rank[]` или `outDegree[]` в heap не загружается.
 
 Фаза 1, scatter:
@@ -186,7 +193,7 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 Фаза 3, convergence:
 
 - `rank_current.bin` и `rank_next.bin` читаются chunk-ами;
-- считается `l1Diff` и `rankSum`;
+- chunks обрабатываются параллельно, затем считается общий `l1Diff` и `rankSum`;
 - если `abs(rankSum - 1.0) > 1e-6`, пишется warning;
 - rank files меняются местами через safer rename sequence с временным файлом и попыткой rollback;
 - messages удаляются после итерации, если `--keep-messages false`.
@@ -231,7 +238,7 @@ O(chunkSize * activeTasks)
 --chunk-size 10000..100000
 ```
 
-Для большего heap `chunk-size` можно увеличивать. При явно рискованной комбинации `chunk-size`, `threads` и `Runtime.maxMemory()` приложение пишет conservative warning, но не останавливает запуск.
+Для большего heap `chunk-size` можно увеличивать. Конфигурации, которые требуют impossible heap buffers или явно слишком большой gather cache относительно `Runtime.maxMemory()`, отклоняются на этапе parsing. Остальные рискованные комбинации получают conservative warning, но не останавливают запуск.
 
 External sort chunks имеют internal caps отдельно от PageRank `chunk-size`:
 
@@ -309,10 +316,24 @@ message record: int,double     = 12 bytes
 ./gradlew jar
 ```
 
-Docker build использует Gradle wrapper из репозитория:
+Первый запуск Gradle wrapper может требовать интернет, потому что Gradle distribution скачивается с `services.gradle.org`. Docker build также использует Gradle wrapper и требует интернет для Gradle/JUnit dependencies:
 
 ```bash
 docker build -t largegraph-pagerank .
+```
+
+Fallback без Gradle/JUnit, если нужно только собрать и запустить приложение:
+
+```bash
+mkdir -p out
+javac --release 21 -d out $(find src/main/java -name '*.java')
+
+java -Xmx128m -cp out org.example.largegraph.Main \
+  --input data/edges.csv \
+  --output output/pagerank.csv \
+  --workdir work \
+  --chunk-size 100000 \
+  --threads 8
 ```
 
 Запуск:
@@ -326,6 +347,16 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
   --threads 8 \
   --max-iterations 200
 ```
+
+## Benchmark Evidence
+
+Пример smoke benchmark на synthetic graph с фиксированным seed:
+
+| Dataset | V | input E | stored E | heap | chunk-size | threads | iterations | rankSum |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| synthetic-hyper seed=42 | 50,000 | 300,000 | около 300,000 после dedup | `-Xmx128m` | 10,000 | 4 | 3 | около 1.0 |
+
+Точный wall-clock time и max disk зависят от SSD/OS cache, поэтому фиксируются в локальном run log, а `*.meta.json` рядом с output сохраняет `vertices`, `edges`, `iterations`, `status`, `lastDelta`, `rankSum`, `damping`, `chunkSize`, `threads`.
 
 Полный пример:
 

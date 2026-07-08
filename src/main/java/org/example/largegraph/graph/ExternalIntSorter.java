@@ -59,8 +59,14 @@ public final class ExternalIntSorter {
                 java.util.Arrays.sort(chunk, 0, count);
                 Path run = tempDir.resolve("int-run-%05d.bin".formatted(runId++));
                 try (IntWriter writer = new IntWriter(run)) {
+                    boolean haveLast = false;
+                    int last = 0;
                     for (int i = 0; i < count; i++) {
-                        writer.write(chunk[i]);
+                        if (!haveLast || chunk[i] != last) {
+                            writer.write(chunk[i]);
+                            last = chunk[i];
+                            haveLast = true;
+                        }
                     }
                 }
                 addRunBounded(runs, run, tempDir);

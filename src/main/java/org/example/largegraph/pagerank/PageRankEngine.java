@@ -64,13 +64,13 @@ public final class PageRankEngine {
                 deleteRecursively(iterationMessagesDir);
                 Files.createDirectories(iterationMessagesDir);
 
-                double danglingMass = calculateDanglingMass(graph);
+                double danglingMass = calculateDanglingMass(graph, executor);
                 scatter(graph, iterationMessagesDir, executor, scatterWork);
                 double base = (1.0 - config.damping()) / graph.vertexCount()
                         + config.damping() * danglingMass / graph.vertexCount();
                 gather(graph, iterationMessagesDir, base, executor);
 
-                ConvergenceStats stats = calculateConvergence(graph);
+                ConvergenceStats stats = calculateConvergence(graph, executor);
                 lastDiff = stats.l1Diff();
                 lastRankSum = stats.rankSum();
                 if (Math.abs(lastRankSum - 1.0) > RANK_SUM_WARNING_THRESHOLD) {
@@ -113,18 +113,29 @@ public final class PageRankEngine {
         }
     }
 
-    private double calculateDanglingMass(PreprocessingResult graph) throws IOException {
+    private double calculateDanglingMass(PreprocessingResult graph, ExecutorService executor) throws IOException {
+        List<Callable<Double>> tasks = new ArrayList<>();
+        for (long start = 0; start < graph.vertexCount(); start += graph.chunkSize()) {
+            long chunkStart = start;
+            tasks.add(() -> calculateDanglingMassChunk(graph, chunkStart));
+        }
+        double danglingMass = 0.0;
+        for (double localMass : invokeAll(executor, tasks)) {
+            danglingMass += localMass;
+        }
+        return danglingMass;
+    }
+
+    private double calculateDanglingMassChunk(PreprocessingResult graph, long start) throws IOException {
         double danglingMass = 0.0;
         try (DiskDoubleArray ranks = new DiskDoubleArray(graph.rankCurrentPath(), graph.vertexCount(), graph.chunkSize(), false);
              DiskIntArray outDegree = new DiskIntArray(graph.outDegreePath(), graph.vertexCount(), graph.chunkSize(), false)) {
-            for (long start = 0; start < graph.vertexCount(); start += graph.chunkSize()) {
-                int length = chunkLength(graph, start);
-                double[] rankChunk = ranks.readChunk(start, length);
-                int[] degreeChunk = outDegree.readIntChunk(start, length);
-                for (int i = 0; i < length; i++) {
-                    if (degreeChunk[i] == 0) {
-                        danglingMass += rankChunk[i];
-                    }
+            int length = chunkLength(graph, start);
+            double[] rankChunk = ranks.readChunk(start, length);
+            int[] degreeChunk = outDegree.readIntChunk(start, length);
+            for (int i = 0; i < length; i++) {
+                if (degreeChunk[i] == 0) {
+                    danglingMass += rankChunk[i];
                 }
             }
         }
@@ -466,19 +477,32 @@ public final class PageRankEngine {
         return bytes;
     }
 
-    private ConvergenceStats calculateConvergence(PreprocessingResult graph) throws IOException {
+    private ConvergenceStats calculateConvergence(PreprocessingResult graph, ExecutorService executor) throws IOException {
+        List<Callable<ConvergenceStats>> tasks = new ArrayList<>();
+        for (long start = 0; start < graph.vertexCount(); start += graph.chunkSize()) {
+            long chunkStart = start;
+            tasks.add(() -> calculateConvergenceChunk(graph, chunkStart));
+        }
+        double l1Diff = 0.0;
+        double rankSum = 0.0;
+        for (ConvergenceStats stats : invokeAll(executor, tasks)) {
+            l1Diff += stats.l1Diff();
+            rankSum += stats.rankSum();
+        }
+        return new ConvergenceStats(l1Diff, rankSum);
+    }
+
+    private ConvergenceStats calculateConvergenceChunk(PreprocessingResult graph, long start) throws IOException {
         double l1Diff = 0.0;
         double rankSum = 0.0;
         try (DiskDoubleArray current = new DiskDoubleArray(graph.rankCurrentPath(), graph.vertexCount(), graph.chunkSize(), false);
              DiskDoubleArray next = new DiskDoubleArray(graph.rankNextPath(), graph.vertexCount(), graph.chunkSize(), false)) {
-            for (long start = 0; start < graph.vertexCount(); start += graph.chunkSize()) {
-                int length = chunkLength(graph, start);
-                double[] currentChunk = current.readChunk(start, length);
-                double[] nextChunk = next.readChunk(start, length);
-                for (int i = 0; i < length; i++) {
-                    l1Diff += Math.abs(nextChunk[i] - currentChunk[i]);
-                    rankSum += nextChunk[i];
-                }
+            int length = chunkLength(graph, start);
+            double[] currentChunk = current.readChunk(start, length);
+            double[] nextChunk = next.readChunk(start, length);
+            for (int i = 0; i < length; i++) {
+                l1Diff += Math.abs(nextChunk[i] - currentChunk[i]);
+                rankSum += nextChunk[i];
             }
         }
         return new ConvergenceStats(l1Diff, rankSum);

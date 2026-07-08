@@ -12,7 +12,12 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.TreeSet;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -163,6 +168,29 @@ final class PageRankEngineTest {
         assertEquals(Files.readString(outputA), Files.readString(outputB));
     }
 
+    @Test
+    void matchesInMemoryOracleOnSmallTrickyGraph() throws IOException {
+        Path input = tempDir.resolve("oracle.csv");
+        Files.writeString(input, """
+                from,to
+                -10,5
+                -10,5
+                5,5
+                5,100
+                200,-10
+                300,200
+                """);
+
+        RunResult run = run(input, tempDir.resolve("oracle"), 2, 7);
+        double[] actual = readAllRanks(run.result());
+        double[] expected = inMemoryPageRank(input, 0.85, run.result().iterations());
+
+        assertEquals(expected.length, actual.length);
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals(expected[i], actual[i], 1e-9);
+        }
+    }
+
     private RunResult run(Path input, Path workDir, int chunkSize, int maxIterations) throws IOException {
         return run(input, workDir, tempDir.resolve("out-" + workDir.getFileName() + ".csv"), chunkSize, maxIterations);
     }
@@ -206,6 +234,64 @@ final class PageRankEngineTest {
             }
         }
         return sum;
+    }
+
+    private static double[] inMemoryPageRank(Path input, double damping, int iterations) throws IOException {
+        List<int[]> inputEdges = Files.readAllLines(input)
+                .stream()
+                .skip(1)
+                .filter(line -> !line.isBlank())
+                .map(line -> {
+                    String[] parts = line.split(",", -1);
+                    return new int[]{Integer.parseInt(parts[0].trim()), Integer.parseInt(parts[1].trim())};
+                })
+                .toList();
+
+        TreeSet<Integer> originalIds = new TreeSet<>();
+        for (int[] edge : inputEdges) {
+            originalIds.add(edge[0]);
+            originalIds.add(edge[1]);
+        }
+
+        Map<Integer, Integer> denseByOriginal = new TreeMap<>();
+        int dense = 0;
+        for (int originalId : originalIds) {
+            denseByOriginal.put(originalId, dense++);
+        }
+
+        List<HashSet<Integer>> adjacency = new ArrayList<>();
+        for (int i = 0; i < denseByOriginal.size(); i++) {
+            adjacency.add(new HashSet<>());
+        }
+        for (int[] edge : inputEdges) {
+            adjacency.get(denseByOriginal.get(edge[0])).add(denseByOriginal.get(edge[1]));
+        }
+
+        int vertexCount = denseByOriginal.size();
+        double[] rank = new double[vertexCount];
+        java.util.Arrays.fill(rank, 1.0 / vertexCount);
+        for (int iteration = 0; iteration < iterations; iteration++) {
+            double danglingMass = 0.0;
+            for (int from = 0; from < vertexCount; from++) {
+                if (adjacency.get(from).isEmpty()) {
+                    danglingMass += rank[from];
+                }
+            }
+            double base = (1.0 - damping) / vertexCount + damping * danglingMass / vertexCount;
+            double[] next = new double[vertexCount];
+            java.util.Arrays.fill(next, base);
+            for (int from = 0; from < vertexCount; from++) {
+                HashSet<Integer> targets = adjacency.get(from);
+                if (!targets.isEmpty()) {
+                    double contribution = damping * rank[from] / targets.size();
+                    for (int to : targets) {
+                        next[to] += contribution;
+                    }
+                }
+            }
+            rank = next;
+        }
+        return rank;
     }
 
     private record RunResult(AppConfig config, PageRankEngine.PageRankRunResult result) {

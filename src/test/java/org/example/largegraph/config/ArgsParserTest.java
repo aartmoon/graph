@@ -14,7 +14,7 @@ final class ArgsParserTest {
         assertEquals("data/edges.csv", config.input().toString());
         assertEquals("output/pagerank.csv", config.output().toString());
         assertEquals("work", config.workDir().toString());
-        assertEquals(1_000_000, config.chunkSize());
+        assertEquals(10_000, config.chunkSize());
         assertEquals(8, config.threads());
         assertEquals(0.85, config.damping());
         assertEquals(200, config.maxIterations());
@@ -72,7 +72,7 @@ final class ArgsParserTest {
                 "--input", "data/edges.csv",
                 "--output", "output/pagerank.csv",
                 "--workdir", "work",
-                "--chunk-size", "1000000",
+                "--chunk-size", "10000",
                 "--threads", "8",
                 "--damping", "0.85",
                 "--max-iterations", "200",
