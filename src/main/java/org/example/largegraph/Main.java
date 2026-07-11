@@ -4,20 +4,15 @@ import org.example.largegraph.config.AppConfig;
 import org.example.largegraph.config.ArgsParser;
 import org.example.largegraph.graph.GraphPreprocessor;
 import org.example.largegraph.graph.GraphPreprocessor.PreprocessingResult;
-import org.example.largegraph.io.MessageBucketLayout;
 import org.example.largegraph.pagerank.PageRankEngine;
 import org.example.largegraph.pagerank.PageRankEngine.PageRankRunResult;
 import org.example.largegraph.pagerank.PageRankResultWriter;
-import org.example.largegraph.util.MemoryUtils;
 import org.example.largegraph.util.ProgressLogger;
 
 import java.io.IOException;
 import java.nio.file.Files;
 
 public final class Main {
-    private static final int MAX_INT_SORT_CHUNK = 500_000;
-    private static final int MAX_RECORD_SORT_CHUNK = 250_000;
-
     private Main() {
     }
 
@@ -27,10 +22,8 @@ public final class Main {
             prepareDirectories(config);
 
             ProgressLogger logger = new ProgressLogger();
-            warnIfChunkSizeLooksRisky(config, logger);
             logger.info("Starting preprocessing");
             PreprocessingResult graph = new GraphPreprocessor(config, logger).preprocess();
-            warnIfGatherLayoutLooksRisky(graph, config, logger);
 
             logger.info("Starting PageRank engine");
             PageRankRunResult result = new PageRankEngine(config, logger).run(graph);
@@ -51,79 +44,6 @@ public final class Main {
         }
     }
 
-    private static void warnIfChunkSizeLooksRisky(AppConfig config, ProgressLogger logger) {
-        long activeTasks = Math.max(1, config.threads());
-        long scatterEstimate = safeMultiply(
-                safeMultiply(config.chunkSize(), (long) Double.BYTES + Integer.BYTES),
-                activeTasks
-        );
-        long intSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK), Integer.BYTES);
-        long recordSortChunkEstimate = safeMultiply(Math.min(config.chunkSize(), MAX_RECORD_SORT_CHUNK), 32L);
-        long topKEstimate = safeMultiply(config.topK(), 32L);
-        long maxHeap = MemoryUtils.maxHeapBytes();
-        long largestEstimate = Math.max(
-                Math.max(scatterEstimate, topKEstimate),
-                Math.max(intSortChunkEstimate, recordSortChunkEstimate)
-        );
-        if (largestEstimate > maxHeap / 2) {
-            logger.info("""
-                    WARNING memory configuration may be risky:
-                      maxHeap=%s
-                      scatterEstimate=%s
-                      intSortChunkEstimate=%s
-                      recordSortChunkEstimate=%s
-                      topKEstimate=%s
-                      consider --chunk-size 10000..100000 for -Xmx128m"""
-                    .formatted(
-                            MemoryUtils.humanReadableBytes(maxHeap),
-                            MemoryUtils.humanReadableBytes(scatterEstimate),
-                            MemoryUtils.humanReadableBytes(intSortChunkEstimate),
-                            MemoryUtils.humanReadableBytes(recordSortChunkEstimate),
-                            MemoryUtils.humanReadableBytes(topKEstimate)
-                    ));
-        }
-    }
-
-    private static void warnIfGatherLayoutLooksRisky(
-            PreprocessingResult graph,
-            AppConfig config,
-            ProgressLogger logger
-    ) {
-        MessageBucketLayout layout = new MessageBucketLayout(
-                graph.destinationPartitionCount(),
-                graph.chunkSize(),
-                graph.vertexCount()
-        );
-        long activeTasks = Math.max(1, config.threads());
-        long gatherRangeEstimate = safeMultiply(
-                safeMultiply(layout.verticesPerBucket(), (long) Double.BYTES),
-                activeTasks
-        );
-        long maxHeap = MemoryUtils.maxHeapBytes();
-        if (gatherRangeEstimate > maxHeap / 2) {
-            logger.info("""
-                    WARNING gather layout may be risky:
-                      maxHeap=%s
-                      gatherRangeEstimate=%s
-                      messageBuckets=%d
-                      verticesPerBucket=%d"""
-                    .formatted(
-                            MemoryUtils.humanReadableBytes(maxHeap),
-                            MemoryUtils.humanReadableBytes(gatherRangeEstimate),
-                            layout.bucketCount(),
-                            layout.verticesPerBucket()
-                    ));
-        }
-    }
-
-    private static long safeMultiply(long left, long right) {
-        try {
-            return Math.multiplyExact(left, right);
-        } catch (ArithmeticException ex) {
-            return Long.MAX_VALUE;
-        }
-    }
-
     private static void prepareDirectories(AppConfig config) throws IOException {
         try {
             Files.createDirectories(config.workDir());
@@ -132,9 +52,6 @@ public final class Main {
         }
         if (!Files.isDirectory(config.workDir())) {
             throw new IOException("workdir path is not a directory: " + config.workDir());
-        }
-        if (config.output().getParent() != null) {
-            Files.createDirectories(config.output().getParent());
         }
     }
 }

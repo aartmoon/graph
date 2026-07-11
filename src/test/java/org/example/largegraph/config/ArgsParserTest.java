@@ -3,7 +3,6 @@ package org.example.largegraph.config;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 final class ArgsParserTest {
@@ -19,10 +18,7 @@ final class ArgsParserTest {
         assertEquals(0.85, config.damping());
         assertEquals(200, config.maxIterations());
         assertEquals(1e-8, config.epsilon());
-        assertEquals(AppConfig.IdMode.EXTERNAL_DENSE, config.idMode());
-        assertEquals(0, config.topK());
         assertEquals(32L * 1024L * 1024L, config.scatterSliceBytes());
-        assertFalse(config.keepMessages());
     }
 
     @Test
@@ -38,10 +34,7 @@ final class ArgsParserTest {
         assertEquals(0.85, config.damping());
         assertEquals(200, config.maxIterations());
         assertEquals(1e-8, config.epsilon());
-        assertEquals(AppConfig.IdMode.EXTERNAL_DENSE, config.idMode());
-        assertEquals(0, config.topK());
         assertEquals(16L * 1024L * 1024L, config.scatterSliceBytes());
-        assertFalse(config.keepMessages());
     }
 
     @Test
@@ -58,11 +51,13 @@ final class ArgsParserTest {
     }
 
     @Test
-    void rejectsTooLargeTopK() {
+    void rejectsUnknownRemovedOptions() {
         String[] args = validArgs();
-        args[19] = Integer.toString(AppConfig.MAX_TOP_K + 1);
+        String[] withRemovedOption = java.util.Arrays.copyOf(args, args.length + 2);
+        withRemovedOption[args.length] = "--top-k";
+        withRemovedOption[args.length + 1] = "10";
 
-        assertThrows(IllegalArgumentException.class, () -> ArgsParser.parse(args));
+        assertThrows(IllegalArgumentException.class, () -> ArgsParser.parse(withRemovedOption));
     }
 
     private static String[] validArgs() {
@@ -75,10 +70,7 @@ final class ArgsParserTest {
                 "--damping", "0.85",
                 "--max-iterations", "200",
                 "--epsilon", "1e-8",
-                "--id-mode", "external-dense",
-                "--top-k", "0",
-                "--scatter-slice-mb", "32",
-                "--keep-messages", "false"
+                "--scatter-slice-mb", "32"
         };
     }
 }

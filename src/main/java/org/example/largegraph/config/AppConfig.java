@@ -11,12 +11,9 @@ public record AppConfig(
         double damping,
         int maxIterations,
         double epsilon,
-        IdMode idMode,
-        int topK,
-        long scatterSliceBytes,
-        boolean keepMessages
+        long scatterSliceBytes
 ) {
-    public static final int MAX_TOP_K = 1_000_000;
+    public static final int MAX_THREADS = 256;
 
     public AppConfig {
         if (input == null) {
@@ -34,6 +31,9 @@ public record AppConfig(
         if (threads <= 0) {
             throw new IllegalArgumentException("--threads must be positive");
         }
+        if (threads > MAX_THREADS) {
+            throw new IllegalArgumentException("--threads must be <= " + MAX_THREADS);
+        }
         if (damping <= 0.0 || damping >= 1.0) {
             throw new IllegalArgumentException("--damping must be in (0, 1)");
         }
@@ -42,15 +42,6 @@ public record AppConfig(
         }
         if (epsilon <= 0.0 || Double.isNaN(epsilon) || Double.isInfinite(epsilon)) {
             throw new IllegalArgumentException("--epsilon must be a positive finite number");
-        }
-        if (idMode == null) {
-            throw new IllegalArgumentException("--id-mode is required");
-        }
-        if (topK < 0) {
-            throw new IllegalArgumentException("--top-k must be non-negative");
-        }
-        if (topK > MAX_TOP_K) {
-            throw new IllegalArgumentException("--top-k must be <= " + MAX_TOP_K);
         }
         if (scatterSliceBytes <= 0) {
             throw new IllegalArgumentException("--scatter-slice-mb must be positive");
@@ -67,14 +58,4 @@ public record AppConfig(
         }
     }
 
-    public enum IdMode {
-        EXTERNAL_DENSE;
-
-        public static IdMode fromCliValue(String value) {
-            if ("external-dense".equalsIgnoreCase(value) || "contiguous".equalsIgnoreCase(value)) {
-                return EXTERNAL_DENSE;
-            }
-            throw new IllegalArgumentException("unsupported --id-mode: " + value);
-        }
-    }
 }

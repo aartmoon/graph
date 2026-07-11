@@ -1,12 +1,12 @@
 package org.example.largegraph.graph;
 
 import org.example.largegraph.config.AppConfig;
-import org.example.largegraph.io.BinaryEdgeReader;
+import org.example.largegraph.io.BinaryEdgeWriter;
 import org.example.largegraph.io.CsvEdgeReader;
-import org.example.largegraph.io.SourcePartitionWriterManager;
 import org.example.largegraph.storage.DiskDoubleArray;
 import org.example.largegraph.storage.DiskIntArray;
 import org.example.largegraph.util.FileUtils;
+import org.example.largegraph.util.MemoryUtils;
 import org.example.largegraph.util.ProgressLogger;
 
 import java.io.BufferedInputStream;
@@ -16,7 +16,6 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
@@ -28,20 +27,11 @@ import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
-import java.util.Properties;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 
 public final class GraphPreprocessor {
     private static final long PROGRESS_INTERVAL_EDGES = 1_000_000L;
-    private static final int MAX_INT_SORT_CHUNK = 500_000;
     private static final int MAX_RECORD_SORT_CHUNK = 250_000;
-    private static final int MAX_TOTAL_SOURCE_PARTITION_WRITERS = 256;
+    private static final int MIN_SORT_CHUNK = 10_000;
     private static final String WORKDIR_MARKER = ".largegraph-workdir";
 
     private final AppConfig config;
@@ -58,29 +48,24 @@ public final class GraphPreprocessor {
         checkInitialFreeDiskSpace();
 
         boolean success = false;
+        boolean workDirPrepared = false;
         try (WorkDirLock ignored = prepareWorkDir()) {
+            workDirPrepared = true;
             FirstPassStats stats = runFirstPass();
             checkPostFirstPassFreeDiskSpace(stats.edgeCount());
-            ExternalIntSorter.SortUniqueResult vertices = sortVertices();
-            Files.deleteIfExists(vertexIdsUnsortedPath());
-
-            long vertexCount = vertices.uniqueCount();
-            int partitionCount = partitionCount(vertexCount);
-
-            Path vertexDir = config.workDir().resolve("vertex");
-            Files.createDirectories(vertexDir);
-
-            RewriteStats rewriteStats = rewriteEdgesToDenseSourcePartitions(partitionCount);
+            RewriteStats rewriteStats = rewriteEdgesToDenseSourcePartitions();
             if (rewriteStats.reconstructedInputEdges() != stats.edgeCount()) {
                 throw new IOException("dense rewrite lost input edges: expected=%d actual=%d"
                         .formatted(stats.edgeCount(), rewriteStats.reconstructedInputEdges()));
             }
-            createOutDegreeFile(vertexCount);
-            buildOutDegreeBySourcePartition(vertexCount, partitionCount);
-            validateOutDegreeSum(vertexCount, rewriteStats.storedEdges());
+            long vertexCount = rewriteStats.vertexCount();
+            int partitionCount = partitionCount(vertexCount);
+            SourceStorageStats sourceStorage = buildSourceStorageAndOutDegree(vertexCount, partitionCount);
+            if (sourceStorage.edgeCount() != rewriteStats.storedEdges()) {
+                throw new IOException("source storage edge count mismatch: expected=%d actual=%d"
+                        .formatted(rewriteStats.storedEdges(), sourceStorage.edgeCount()));
+            }
             createAndInitializeRankFiles(vertexCount);
-            writeSourcePartitionMetadata(partitionCount);
-            writeMetadata(vertexCount, rewriteStats.storedEdges(), partitionCount);
             cleanupPreprocessingIntermediates();
 
             logger.info("Preprocessing finished: vertices=%d inputEdges=%d storedEdges=%d sourcePartitions=%d"
@@ -96,11 +81,12 @@ public final class GraphPreprocessor {
                     rankCurrentPath(),
                     rankNextPath(),
                     edgesDir(),
-                    verticesPath()
+                    verticesPath(),
+                    sourceStorage.sourcePartitions()
             );
         } finally {
-            if (!success) {
-                cleanupPreprocessingIntermediatesSafely();
+            if (!success && workDirPrepared) {
+                cleanupFailedRunArtifactsSafely();
             }
         }
     }
@@ -109,15 +95,12 @@ public final class GraphPreprocessor {
         long edgeCount = 0;
 
         try (CsvEdgeReader reader = new CsvEdgeReader(config.input());
-             EndpointRefWriter endpointRefs = new EndpointRefWriter(endpointRefsPath());
-             IntValueWriter vertexIds = new IntValueWriter(vertexIdsUnsortedPath())) {
+             EndpointRefWriter endpointRefs = new EndpointRefWriter(endpointRefsPath())) {
             while (reader.next()) {
                 int from = reader.from();
                 int to = reader.to();
-                endpointRefs.write(new EndpointRef(from, edgeCount, (byte) 0));
-                endpointRefs.write(new EndpointRef(to, edgeCount, (byte) 1));
-                vertexIds.write(from);
-                vertexIds.write(to);
+                endpointRefs.write(from, edgeCount, (byte) 0);
+                endpointRefs.write(to, edgeCount, (byte) 1);
                 edgeCount++;
                 logProgress("pass-1", edgeCount);
             }
@@ -130,24 +113,9 @@ public final class GraphPreprocessor {
         return new FirstPassStats(edgeCount);
     }
 
-    private ExternalIntSorter.SortUniqueResult sortVertices() throws IOException {
-        logger.info("Sorting and deduplicating observed vertex ids");
-        ExternalIntSorter sorter = new ExternalIntSorter(intSortChunkSize());
-        ExternalIntSorter.SortUniqueResult result = sorter.sortUniqueToVerticesAndMapping(
-                vertexIdsUnsortedPath(),
-                verticesPath(),
-                mappingPath(),
-                config.workDir().resolve("sort").resolve("vertices")
-        );
-        if (result.uniqueCount() == 0) {
-            throw new IllegalArgumentException("empty graph: input contains no vertices");
-        }
-        logger.info("Vertex reindexing finished: observedVertices=%d".formatted(result.uniqueCount()));
-        return result;
-    }
-
-    private RewriteStats rewriteEdgesToDenseSourcePartitions(int partitionCount) throws IOException {
+    private RewriteStats rewriteEdgesToDenseSourcePartitions() throws IOException {
         logger.info("Sorting endpoint references by original id");
+        ensureSpaceForExternalSort(endpointRefsPath(), "endpoint reference sort");
         new EndpointRefExternalSorter(recordSortChunkSize()).sort(
                 endpointRefsPath(),
                 endpointRefsSortedPath(),
@@ -156,12 +124,12 @@ public final class GraphPreprocessor {
         );
         Files.deleteIfExists(endpointRefsPath());
 
-        logger.info("Joining endpoints with dense mapping");
-        mergeJoinEndpointAssignments();
-        Files.deleteIfExists(mappingPath());
+        logger.info("Assigning dense vertex ids from sorted endpoints");
+        long vertexCount = writeVerticesAndEndpointAssignments();
         Files.deleteIfExists(endpointRefsSortedPath());
 
         logger.info("Sorting endpoint assignments by edge id");
+        ensureSpaceForExternalSort(endpointAssignmentsPath(), "endpoint assignment sort");
         new EndpointAssignmentExternalSorter(recordSortChunkSize()).sort(
                 endpointAssignmentsPath(),
                 endpointAssignmentsSortedPath(),
@@ -175,6 +143,7 @@ public final class GraphPreprocessor {
         Files.deleteIfExists(endpointAssignmentsSortedPath());
 
         logger.info("Sorting and deduplicating dense edges");
+        ensureSpaceForExternalSort(denseEdgesPath(), "dense edge sort");
         new DenseEdgeExternalSorter(recordSortChunkSize()).sortUnique(
                 denseEdgesPath(),
                 denseEdgesSortedPath(),
@@ -183,33 +152,134 @@ public final class GraphPreprocessor {
         );
         Files.deleteIfExists(denseEdgesPath());
 
-        logger.info("Writing dense source partitions");
-        long storedEdges = writeDenseSourcePartitions(partitionCount);
-        Files.deleteIfExists(denseEdgesSortedPath());
-        return new RewriteStats(reconstructedInputEdges, storedEdges);
+        long storedEdges = Files.size(denseEdgesSortedPath()) / (Integer.BYTES * 2L);
+        logger.info("Dense edge rewrite finished: vertices=%d storedEdges=%d".formatted(vertexCount, storedEdges));
+        return new RewriteStats(vertexCount, reconstructedInputEdges, storedEdges);
     }
 
-    private void mergeJoinEndpointAssignments() throws IOException {
+    private long writeVerticesAndEndpointAssignments() throws IOException {
+        long vertexCount = 0;
+        boolean havePrevious = false;
+        int previousOriginalId = 0;
+        int denseId = -1;
+
         try (EndpointRefReader endpoints = new EndpointRefReader(endpointRefsSortedPath());
-             MappingReader mapping = new MappingReader(mappingPath());
+             IntValueWriter vertices = new IntValueWriter(verticesPath());
              EndpointAssignmentWriter assignments = new EndpointAssignmentWriter(endpointAssignmentsPath())) {
-            Optional<MappingRecord> mappingRecord = mapping.next();
-            Optional<EndpointRef> endpointRecord;
-            while ((endpointRecord = endpoints.next()).isPresent()) {
-                int originalId = endpointRecord.get().originalId();
-                while (mappingRecord.isPresent() && mappingRecord.get().originalId() < originalId) {
-                    mappingRecord = mapping.next();
+            while (endpoints.next()) {
+                int originalId = endpoints.originalId();
+                if (!havePrevious || originalId != previousOriginalId) {
+                    if (denseId == Integer.MAX_VALUE - 1) {
+                        throw new IOException("vertex count exceeds supported int dense id model");
+                    }
+                    denseId++;
+                    vertices.write(originalId);
+                    previousOriginalId = originalId;
+                    havePrevious = true;
+                    vertexCount++;
                 }
-                if (mappingRecord.isEmpty() || mappingRecord.get().originalId() != originalId) {
-                    throw new IOException("missing dense id for original vertex id: " + originalId);
-                }
-                assignments.write(new EndpointAssignment(
-                        endpointRecord.get().edgeId(),
-                        endpointRecord.get().side(),
-                        mappingRecord.get().denseId()
-                ));
+                assignments.write(endpoints.edgeId(), endpoints.side(), denseId);
             }
         }
+        if (vertexCount == 0) {
+            throw new IllegalArgumentException("empty graph: input contains no vertices");
+        }
+        logger.info("Vertex reindexing finished: observedVertices=%d".formatted(vertexCount));
+        return vertexCount;
+    }
+
+    private SourceStorageStats buildSourceStorageAndOutDegree(long vertexCount, int partitionCount) throws IOException {
+        logger.info("Writing dense source partitions and out-degree");
+        List<SourcePartitionInfo> sourcePartitions = new ArrayList<>(partitionCount);
+        long edgeCount = 0;
+        boolean hasNextEdge;
+
+        try (DenseEdgeReader reader = new DenseEdgeReader(denseEdgesSortedPath());
+             DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize())) {
+            int[] outDegreeChunk = new int[config.chunkSize()];
+            ByteBuffer scratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
+            hasNextEdge = reader.next();
+            for (int partition = 0; partition < partitionCount; partition++) {
+                long sourceStart = (long) partition * config.chunkSize();
+                long sourceEnd = Math.min(vertexCount, sourceStart + config.chunkSize());
+                int sourceLength = (int) (sourceEnd - sourceStart);
+                Arrays.fill(outDegreeChunk, 0, sourceLength, 0);
+
+                PartitionWriteResult result = writeSourcePartition(
+                        reader,
+                        hasNextEdge,
+                        partition,
+                        sourceStart,
+                        sourceEnd,
+                        outDegreeChunk
+                );
+                hasNextEdge = result.hasNextEdge();
+                edgeCount += result.edgeCount();
+                outDegree.writeIntChunk(sourceStart, outDegreeChunk, sourceLength, scratch);
+                sourcePartitions.add(new SourcePartitionInfo(
+                        partition,
+                        result.edgeCount(),
+                        result.edgeCount() * Integer.BYTES * 2L
+                ));
+                logProgress("dense-dedup-write", edgeCount);
+            }
+            if (hasNextEdge) {
+                throw new IOException("dense edge source partition out of range: " + reader.from());
+            }
+        }
+        Files.deleteIfExists(denseEdgesSortedPath());
+        return new SourceStorageStats(edgeCount, List.copyOf(sourcePartitions));
+    }
+
+    private PartitionWriteResult writeSourcePartition(
+            DenseEdgeReader reader,
+            boolean hasFirstEdge,
+            int partition,
+            long sourceStart,
+            long sourceEnd,
+            int[] outDegreeChunk
+    ) throws IOException {
+        boolean hasEdge = hasFirstEdge;
+        long edgeCount = 0;
+        BinaryEdgeWriter writer = null;
+        IOException failure = null;
+        Path path = edgesDir().resolve("src-part-%05d.bin".formatted(partition));
+        try {
+            while (hasEdge && reader.from() < sourceEnd) {
+                int from = reader.from();
+                int to = reader.to();
+                if (from < sourceStart) {
+                    throw new IOException("dense edge source partition order is corrupt: from=" + from);
+                }
+                if (writer == null) {
+                    writer = new BinaryEdgeWriter(path);
+                }
+                writer.write(from, to);
+                int localFrom = Math.toIntExact(from - sourceStart);
+                if (outDegreeChunk[localFrom] == Integer.MAX_VALUE) {
+                    throw new IOException("out-degree exceeds int32 for dense vertex " + from);
+                }
+                outDegreeChunk[localFrom]++;
+                edgeCount++;
+                hasEdge = reader.next();
+            }
+        } catch (IOException ex) {
+            failure = ex;
+            throw ex;
+        } finally {
+            if (writer != null) {
+                try {
+                    writer.close();
+                } catch (IOException ex) {
+                    if (failure != null) {
+                        failure.addSuppressed(ex);
+                    } else {
+                        throw ex;
+                    }
+                }
+            }
+        }
+        return new PartitionWriteResult(hasEdge, edgeCount);
     }
 
     private long writeDenseEdges() throws IOException {
@@ -217,50 +287,27 @@ public final class GraphPreprocessor {
 
         try (EndpointAssignmentReader reader = new EndpointAssignmentReader(endpointAssignmentsSortedPath());
              DenseEdgeWriter writer = new DenseEdgeWriter(denseEdgesPath())) {
-            Optional<EndpointAssignment> fromRecord;
-            while ((fromRecord = reader.next()).isPresent()) {
-                Optional<EndpointAssignment> toRecord = reader.next();
-                if (toRecord.isEmpty()) {
-                    throw new IOException("dangling endpoint assignment for edge " + fromRecord.get().edgeId());
+            long expectedEdgeId = 0;
+            while (reader.next()) {
+                long fromEdgeId = reader.edgeId();
+                byte fromSide = reader.side();
+                int from = reader.denseId();
+                if (!reader.next()) {
+                    throw new IOException("dangling endpoint assignment for edge " + fromEdgeId);
                 }
-                if (fromRecord.get().edgeId() != toRecord.get().edgeId()
-                        || fromRecord.get().side() != 0
-                        || toRecord.get().side() != 1) {
-                    throw new IOException("corrupt endpoint assignments around edge " + fromRecord.get().edgeId());
+                if (fromEdgeId != expectedEdgeId
+                        || reader.edgeId() != expectedEdgeId
+                        || fromSide != 0
+                        || reader.side() != 1) {
+                    throw new IOException("corrupt endpoint assignments around expected edge " + expectedEdgeId);
                 }
-                int from = fromRecord.get().denseId();
-                int to = toRecord.get().denseId();
-                writer.write(new DenseEdge(from, to));
+                writer.write(from, reader.denseId());
                 edgeCount++;
+                expectedEdgeId++;
                 logProgress("dense-rewrite", edgeCount);
             }
         }
         return edgeCount;
-    }
-
-    private long writeDenseSourcePartitions(int partitionCount) throws IOException {
-        int maxOpenWriters = Math.min(partitionCount, MAX_TOTAL_SOURCE_PARTITION_WRITERS);
-        long edgeCount = 0;
-
-        try (DenseEdgeReader reader = new DenseEdgeReader(denseEdgesSortedPath());
-             SourcePartitionWriterManager writerManager =
-                     new SourcePartitionWriterManager(config.workDir(), partitionCount, maxOpenWriters)) {
-            Optional<DenseEdge> edge;
-            while ((edge = reader.next()).isPresent()) {
-                DenseEdge current = edge.get();
-                int sourcePartition = current.from() / config.chunkSize();
-                writerManager.write(sourcePartition, current.from(), current.to());
-                edgeCount++;
-                logProgress("dense-dedup-write", edgeCount);
-            }
-        }
-        return edgeCount;
-    }
-
-    private void createOutDegreeFile(long vertexCount) throws IOException {
-        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize())) {
-            outDegree.fill(0);
-        }
     }
 
     private void createAndInitializeRankFiles(long vertexCount) throws IOException {
@@ -271,111 +318,7 @@ public final class GraphPreprocessor {
         }
     }
 
-    private void validateOutDegreeSum(long vertexCount, long expectedEdges) throws IOException {
-        long degreeSum = 0;
-        int[] chunk = new int[config.chunkSize()];
-        ByteBuffer scratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
-        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize(), false)) {
-            for (long start = 0; start < vertexCount; start += config.chunkSize()) {
-                int length = (int) Math.min(config.chunkSize(), vertexCount - start);
-                outDegree.readIntChunk(start, chunk, 0, length, scratch);
-                for (int i = 0; i < length; i++) {
-                    degreeSum += chunk[i];
-                }
-            }
-        }
-        if (degreeSum != expectedEdges) {
-            throw new IOException("out-degree sum mismatch: expected=%d actual=%d"
-                    .formatted(expectedEdges, degreeSum));
-        }
-    }
-
-    private void buildOutDegreeBySourcePartition(long vertexCount, int partitionCount) throws IOException {
-        int taskCount = Math.min(config.threads(), Math.max(1, partitionCount));
-        ExecutorService executor = Executors.newFixedThreadPool(taskCount);
-        try {
-            List<PartitionRange> ranges = partitionRanges(partitionCount, taskCount);
-            List<Callable<Void>> tasks = new ArrayList<>(ranges.size());
-            for (PartitionRange range : ranges) {
-                tasks.add(() -> {
-                    buildOutDegreeForSourcePartitionRange(vertexCount, range);
-                    return null;
-                });
-            }
-            invokeAll(executor, tasks);
-        } finally {
-            shutdown(executor);
-        }
-    }
-
-    private List<PartitionRange> partitionRanges(int partitionCount, int rangeCount) {
-        List<PartitionRange> ranges = new ArrayList<>(rangeCount);
-        int partitionsPerRange = Math.ceilDiv(partitionCount, rangeCount);
-        for (int range = 0; range < rangeCount; range++) {
-            int start = range * partitionsPerRange;
-            int end = Math.min(partitionCount, start + partitionsPerRange);
-            if (start < end) {
-                ranges.add(new PartitionRange(start, end));
-            }
-        }
-        return ranges;
-    }
-
-    private void buildOutDegreeForSourcePartitionRange(long vertexCount, PartitionRange range) throws IOException {
-        int[] outDegreeChunk = new int[config.chunkSize()];
-        ByteBuffer scratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
-        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize(), true, false)) {
-            for (int sourcePartition = range.startPartition(); sourcePartition < range.endPartitionExclusive(); sourcePartition++) {
-                buildOutDegreeForSourcePartition(outDegree, vertexCount, sourcePartition, outDegreeChunk, scratch);
-            }
-        }
-    }
-
-    private void buildOutDegreeForSourcePartition(
-            DiskIntArray outDegree,
-            long vertexCount,
-            int sourcePartition,
-            int[] outDegreeChunk,
-            ByteBuffer scratch
-    ) throws IOException {
-        long sourceStart = (long) sourcePartition * config.chunkSize();
-        int sourceLength = (int) Math.min(config.chunkSize(), vertexCount - sourceStart);
-        Arrays.fill(outDegreeChunk, 0, sourceLength, 0);
-        Path sourcePartitionPath = edgesDir().resolve("src-part-%05d.bin".formatted(sourcePartition));
-        if (Files.exists(sourcePartitionPath)) {
-            try (BinaryEdgeReader edgeReader = new BinaryEdgeReader(sourcePartitionPath)) {
-                while (edgeReader.next()) {
-                    int localFrom = Math.toIntExact(edgeReader.denseFrom() - sourceStart);
-                    outDegreeChunk[localFrom]++;
-                }
-            }
-        }
-
-        outDegree.writeIntChunk(sourceStart, outDegreeChunk, sourceLength, scratch);
-    }
-
-    private void writeSourcePartitionMetadata(int partitionCount) throws IOException {
-        Path metadataPath = edgesDir().resolve("source-partitions.tsv");
-        try (var writer = Files.newBufferedWriter(metadataPath)) {
-            writer.write("partition\tedges\tbytes");
-            writer.newLine();
-            for (int partition = 0; partition < partitionCount; partition++) {
-                Path path = edgesDir().resolve("src-part-%05d.bin".formatted(partition));
-                long bytes = Files.exists(path) ? Files.size(path) : 0L;
-                writer.write(Integer.toString(partition));
-                writer.write('\t');
-                writer.write(Long.toString(bytes / (Integer.BYTES * 2L)));
-                writer.write('\t');
-                writer.write(Long.toString(bytes));
-                writer.newLine();
-            }
-        }
-    }
-
     private void validateInput() {
-        if (config.idMode() != AppConfig.IdMode.EXTERNAL_DENSE) {
-            throw new IllegalArgumentException("only --id-mode external-dense is supported");
-        }
         if (!Files.exists(config.input())) {
             throw new IllegalArgumentException("input file does not exist: " + config.input());
         }
@@ -386,10 +329,11 @@ public final class GraphPreprocessor {
 
     private void validatePathLayout() throws IOException {
         Path input = config.input().toRealPath();
-        Path work = config.workDir().toAbsolutePath().normalize();
-        Path output = config.output().toAbsolutePath().normalize();
-        if (Files.exists(config.output())) {
-            output = config.output().toRealPath();
+        Files.createDirectories(config.workDir());
+        Path work = config.workDir().toRealPath();
+        Path output = resolvePossiblyMissingPath(config.output());
+        if (input.equals(output)) {
+            throw new IllegalArgumentException("input and output must be different files");
         }
         if (input.startsWith(work)) {
             throw new IllegalArgumentException("input must not be located inside workdir");
@@ -397,9 +341,28 @@ public final class GraphPreprocessor {
         if (output.startsWith(work)) {
             throw new IllegalArgumentException("output must not be located inside workdir");
         }
-        if (input.equals(output)) {
-            throw new IllegalArgumentException("input and output must be different files");
+    }
+
+    private Path resolvePossiblyMissingPath(Path path) throws IOException {
+        if (Files.exists(path)) {
+            return path.toRealPath();
         }
+        Path absolute = path.toAbsolutePath().normalize();
+        Path fileName = absolute.getFileName();
+        Path parent = absolute.getParent();
+        if (parent == null) {
+            return absolute;
+        }
+        Path existingParent = parent;
+        while (existingParent != null && !Files.exists(existingParent)) {
+            existingParent = existingParent.getParent();
+        }
+        if (existingParent == null) {
+            return absolute;
+        }
+        Path realParent = existingParent.toRealPath();
+        Path relative = existingParent.relativize(parent);
+        return realParent.resolve(relative).resolve(fileName).normalize();
     }
 
     private void checkInitialFreeDiskSpace() throws IOException {
@@ -409,7 +372,8 @@ public final class GraphPreprocessor {
         FileStore store = Files.getFileStore(probe);
         long free = store.getUsableSpace();
         long inputSize = Files.size(config.input());
-        requireFreeSpace(free, saturatingMultiply(inputSize, 48L), "initial preprocessing");
+        long reserveBytes = 64L * 1024L * 1024L;
+        requireFreeSpace(free, saturatingAdd(saturatingMultiply(inputSize, 4L), reserveBytes), "initial preprocessing");
     }
 
     private void checkPostFirstPassFreeDiskSpace(long inputEdges) throws IOException {
@@ -419,11 +383,17 @@ public final class GraphPreprocessor {
         long assignmentSortBytes = saturatingMultiply(inputEdges, 26L * 2L);
         long denseSortBytes = saturatingMultiply(inputEdges, 16L);
         long safetyReserve = 64L * 1024L * 1024L;
-        long required = saturatingAdd(
-                saturatingAdd(endpointSortBytes, assignmentSortBytes),
-                saturatingAdd(denseSortBytes, safetyReserve)
-        );
+        long required = saturatingAdd(Math.max(endpointSortBytes, Math.max(assignmentSortBytes, denseSortBytes)), safetyReserve);
         requireFreeSpace(free, required, "post first-pass preprocessing");
+    }
+
+    private void ensureSpaceForExternalSort(Path input, String phase) throws IOException {
+        FileStore store = Files.getFileStore(config.workDir());
+        long free = store.getUsableSpace();
+        long inputSize = Files.size(input);
+        long reserveBytes = 64L * 1024L * 1024L;
+        long required = saturatingAdd(saturatingMultiply(inputSize, 2L), reserveBytes);
+        requireFreeSpace(free, required, phase);
     }
 
     private void requireFreeSpace(long free, long estimatedRequired, String phase) {
@@ -450,11 +420,18 @@ public final class GraphPreprocessor {
     }
 
     private int recordSortChunkSize() {
-        return Math.min(config.chunkSize(), MAX_RECORD_SORT_CHUNK);
+        long budget = Math.max(1L, MemoryUtils.maxHeapBytes() / 16L);
+        long records = budget / 32L;
+        return checkedSortChunk(records, MAX_RECORD_SORT_CHUNK, "record external sort");
     }
 
-    private int intSortChunkSize() {
-        return Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK);
+    private int checkedSortChunk(long calculatedRecords, int maxRecords, String phase) {
+        long records = Math.min(maxRecords, calculatedRecords);
+        if (records < MIN_SORT_CHUNK) {
+            throw new IllegalArgumentException("not enough heap for %s: requiredRecords=%d calculatedRecords=%d"
+                    .formatted(phase, MIN_SORT_CHUNK, calculatedRecords));
+        }
+        return Math.toIntExact(Math.max(MIN_SORT_CHUNK, records));
     }
 
     private WorkDirLock prepareWorkDir() throws IOException {
@@ -477,9 +454,7 @@ public final class GraphPreprocessor {
             deleteRecursively(edgesDir());
             deleteRecursively(config.workDir().resolve("messages"));
             deleteRecursively(config.workDir().resolve("sort"));
-            Files.deleteIfExists(vertexIdsUnsortedPath());
             Files.deleteIfExists(verticesPath());
-            Files.deleteIfExists(mappingPath());
             Files.deleteIfExists(endpointRefsPath());
             Files.deleteIfExists(endpointRefsSortedPath());
             Files.deleteIfExists(endpointAssignmentsPath());
@@ -497,8 +472,6 @@ public final class GraphPreprocessor {
     }
 
     private void cleanupPreprocessingIntermediates() throws IOException {
-        Files.deleteIfExists(vertexIdsUnsortedPath());
-        Files.deleteIfExists(mappingPath());
         Files.deleteIfExists(endpointRefsPath());
         Files.deleteIfExists(endpointRefsSortedPath());
         Files.deleteIfExists(endpointAssignmentsPath());
@@ -516,19 +489,15 @@ public final class GraphPreprocessor {
         }
     }
 
-    private void writeMetadata(long vertexCount, long edgeCount, int partitionCount) throws IOException {
-        Properties properties = new Properties();
-        properties.setProperty("vertexCount", Long.toString(vertexCount));
-        properties.setProperty("edgeCount", Long.toString(edgeCount));
-        properties.setProperty("chunkSize", Integer.toString(config.chunkSize()));
-        properties.setProperty("sourcePartitionCount", Integer.toString(partitionCount));
-        properties.setProperty("destinationPartitionCount", Integer.toString(partitionCount));
-        properties.setProperty("idMode", "external-dense");
-        properties.setProperty("edgeFormat", "int denseFrom,int denseTo");
-        properties.setProperty("messageFormat", "int denseTo,double contribution");
-        properties.setProperty("vertices", verticesPath().toString());
-        try (OutputStream output = Files.newOutputStream(config.workDir().resolve("meta.properties"))) {
-            properties.store(output, "Large Graph PageRank metadata");
+    private void cleanupFailedRunArtifactsSafely() {
+        try {
+            cleanupPreprocessingIntermediates();
+            deleteRecursively(edgesDir());
+            deleteRecursively(config.workDir().resolve("vertex"));
+            deleteRecursively(config.workDir().resolve("messages"));
+            Files.deleteIfExists(verticesPath());
+        } catch (IOException cleanupEx) {
+            logger.info("WARNING failed to cleanup failed run artifacts: " + cleanupEx.getMessage());
         }
     }
 
@@ -540,16 +509,8 @@ public final class GraphPreprocessor {
         return Math.toIntExact(partitions);
     }
 
-    private Path vertexIdsUnsortedPath() {
-        return config.workDir().resolve("vertex_ids_unsorted.bin");
-    }
-
     private Path verticesPath() {
         return config.workDir().resolve("vertices.bin");
-    }
-
-    private Path mappingPath() {
-        return config.workDir().resolve("mapping.bin");
     }
 
     private Path endpointRefsPath() {
@@ -598,41 +559,6 @@ public final class GraphPreprocessor {
         }
     }
 
-    private <T> List<T> invokeAll(ExecutorService executor, List<Callable<T>> tasks) throws IOException {
-        try {
-            List<Future<T>> futures = executor.invokeAll(tasks);
-            List<T> results = new ArrayList<>(futures.size());
-            for (Future<T> future : futures) {
-                results.add(future.get());
-            }
-            return results;
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw new IOException("preprocessing was interrupted", ex);
-        } catch (ExecutionException ex) {
-            Throwable cause = ex.getCause();
-            if (cause instanceof IOException ioException) {
-                throw ioException;
-            }
-            if (cause instanceof RuntimeException runtimeException) {
-                throw runtimeException;
-            }
-            throw new IOException("preprocessing task failed", cause);
-        }
-    }
-
-    private void shutdown(ExecutorService executor) {
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
-            }
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            executor.shutdownNow();
-        }
-    }
-
     private void deleteRecursively(Path path) throws IOException {
         FileUtils.deleteRecursively(path);
     }
@@ -640,10 +566,13 @@ public final class GraphPreprocessor {
     private record FirstPassStats(long edgeCount) {
     }
 
-    private record RewriteStats(long reconstructedInputEdges, long storedEdges) {
+    private record RewriteStats(long vertexCount, long reconstructedInputEdges, long storedEdges) {
     }
 
-    private record PartitionRange(int startPartition, int endPartitionExclusive) {
+    private record SourceStorageStats(long edgeCount, List<SourcePartitionInfo> sourcePartitions) {
+    }
+
+    private record PartitionWriteResult(boolean hasNextEdge, long edgeCount) {
     }
 
     public record PreprocessingResult(
@@ -656,20 +585,16 @@ public final class GraphPreprocessor {
             Path rankCurrentPath,
             Path rankNextPath,
             Path edgesDir,
-            Path verticesPath
+            Path verticesPath,
+            List<SourcePartitionInfo> sourcePartitions
     ) {
     }
 
-    private record MappingRecord(int originalId, int denseId) {
-    }
-
-    private record EndpointRef(int originalId, long edgeId, byte side) {
-    }
-
-    private record EndpointAssignment(long edgeId, byte side, int denseId) {
-    }
-
-    private record DenseEdge(int from, int to) {
+    public record SourcePartitionInfo(
+            int partition,
+            long edges,
+            long bytes
+    ) {
     }
 
     private static final class IntValueWriter implements Closeable {
@@ -692,43 +617,38 @@ public final class GraphPreprocessor {
         }
     }
 
-    private static final class MappingReader implements Closeable {
+    private static final class EndpointRefReader implements Closeable {
         private final DataInputStream input;
-
-        private MappingReader(Path path) throws IOException {
-            validateRecordAlignment(path, Integer.BYTES * 2);
-            this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
-        }
-
-        private Optional<MappingRecord> next() throws IOException {
-            try {
-                return Optional.of(new MappingRecord(input.readInt(), input.readInt()));
-            } catch (EOFException ex) {
-                return Optional.empty();
-            }
-        }
-
-        @Override
-        public void close() throws IOException {
-            input.close();
-        }
-    }
-
-    private static final class EndpointRefReader implements ExternalRecordSorter.RecordReader<EndpointRef> {
-        private final DataInputStream input;
+        private int originalId;
+        private long edgeId;
+        private byte side;
 
         private EndpointRefReader(Path path) throws IOException {
             validateRecordAlignment(path, Integer.BYTES + Long.BYTES + Byte.BYTES);
             this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
         }
 
-        @Override
-        public Optional<EndpointRef> next() throws IOException {
+        public boolean next() throws IOException {
             try {
-                return Optional.of(new EndpointRef(input.readInt(), input.readLong(), input.readByte()));
+                originalId = input.readInt();
+                edgeId = input.readLong();
+                side = input.readByte();
+                return true;
             } catch (EOFException ex) {
-                return Optional.empty();
+                return false;
             }
+        }
+
+        private int originalId() {
+            return originalId;
+        }
+
+        private long edgeId() {
+            return edgeId;
+        }
+
+        private byte side() {
+            return side;
         }
 
         @Override
@@ -737,7 +657,7 @@ public final class GraphPreprocessor {
         }
     }
 
-    private static final class EndpointRefWriter implements ExternalRecordSorter.RecordWriter<EndpointRef> {
+    private static final class EndpointRefWriter implements Closeable {
         private final DataOutputStream output;
 
         private EndpointRefWriter(Path path) throws IOException {
@@ -747,11 +667,10 @@ public final class GraphPreprocessor {
             this.output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)));
         }
 
-        @Override
-        public void write(EndpointRef record) throws IOException {
-            output.writeInt(record.originalId());
-            output.writeLong(record.edgeId());
-            output.writeByte(record.side());
+        public void write(int originalId, long edgeId, byte side) throws IOException {
+            output.writeInt(originalId);
+            output.writeLong(edgeId);
+            output.writeByte(side);
         }
 
         @Override
@@ -760,21 +679,38 @@ public final class GraphPreprocessor {
         }
     }
 
-    private static final class EndpointAssignmentReader implements ExternalRecordSorter.RecordReader<EndpointAssignment> {
+    private static final class EndpointAssignmentReader implements Closeable {
         private final DataInputStream input;
+        private long edgeId;
+        private byte side;
+        private int denseId;
 
         private EndpointAssignmentReader(Path path) throws IOException {
             validateRecordAlignment(path, Long.BYTES + Byte.BYTES + Integer.BYTES);
             this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
         }
 
-        @Override
-        public Optional<EndpointAssignment> next() throws IOException {
+        public boolean next() throws IOException {
             try {
-                return Optional.of(new EndpointAssignment(input.readLong(), input.readByte(), input.readInt()));
+                edgeId = input.readLong();
+                side = input.readByte();
+                denseId = input.readInt();
+                return true;
             } catch (EOFException ex) {
-                return Optional.empty();
+                return false;
             }
+        }
+
+        private long edgeId() {
+            return edgeId;
+        }
+
+        private byte side() {
+            return side;
+        }
+
+        private int denseId() {
+            return denseId;
         }
 
         @Override
@@ -783,7 +719,7 @@ public final class GraphPreprocessor {
         }
     }
 
-    private static final class EndpointAssignmentWriter implements ExternalRecordSorter.RecordWriter<EndpointAssignment> {
+    private static final class EndpointAssignmentWriter implements Closeable {
         private final DataOutputStream output;
 
         private EndpointAssignmentWriter(Path path) throws IOException {
@@ -793,11 +729,10 @@ public final class GraphPreprocessor {
             this.output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)));
         }
 
-        @Override
-        public void write(EndpointAssignment record) throws IOException {
-            output.writeLong(record.edgeId());
-            output.writeByte(record.side());
-            output.writeInt(record.denseId());
+        public void write(long edgeId, byte side, int denseId) throws IOException {
+            output.writeLong(edgeId);
+            output.writeByte(side);
+            output.writeInt(denseId);
         }
 
         @Override
@@ -806,21 +741,32 @@ public final class GraphPreprocessor {
         }
     }
 
-    private static final class DenseEdgeReader implements ExternalRecordSorter.RecordReader<DenseEdge> {
+    private static final class DenseEdgeReader implements Closeable {
         private final DataInputStream input;
+        private int from;
+        private int to;
 
         private DenseEdgeReader(Path path) throws IOException {
             validateRecordAlignment(path, Integer.BYTES * 2);
             this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
         }
 
-        @Override
-        public Optional<DenseEdge> next() throws IOException {
+        public boolean next() throws IOException {
             try {
-                return Optional.of(new DenseEdge(input.readInt(), input.readInt()));
+                from = input.readInt();
+                to = input.readInt();
+                return true;
             } catch (EOFException ex) {
-                return Optional.empty();
+                return false;
             }
+        }
+
+        private int from() {
+            return from;
+        }
+
+        private int to() {
+            return to;
         }
 
         @Override
@@ -829,7 +775,7 @@ public final class GraphPreprocessor {
         }
     }
 
-    private static final class DenseEdgeWriter implements ExternalRecordSorter.RecordWriter<DenseEdge> {
+    private static final class DenseEdgeWriter implements Closeable {
         private final DataOutputStream output;
 
         private DenseEdgeWriter(Path path) throws IOException {
@@ -839,10 +785,9 @@ public final class GraphPreprocessor {
             this.output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)));
         }
 
-        @Override
-        public void write(DenseEdge record) throws IOException {
-            output.writeInt(record.from());
-            output.writeInt(record.to());
+        public void write(int from, int to) throws IOException {
+            output.writeInt(from);
+            output.writeInt(to);
         }
 
         @Override

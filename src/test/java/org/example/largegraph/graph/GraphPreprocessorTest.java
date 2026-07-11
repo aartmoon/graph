@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -38,15 +39,12 @@ final class GraphPreprocessorTest {
         assertEquals(3, result.vertexCount());
         assertEquals(4, result.edgeCount());
         assertEquals(1, result.sourcePartitionCount());
-        assertTrue(Files.exists(workDir.resolve("meta.properties")));
         assertTrue(Files.exists(workDir.resolve("vertices.bin")));
         assertTrue(Files.exists(workDir.resolve("vertex").resolve("out_degree.bin")));
         assertTrue(Files.exists(workDir.resolve("vertex").resolve("rank_current.bin")));
         assertTrue(Files.exists(workDir.resolve("vertex").resolve("rank_next.bin")));
         assertTrue(Files.exists(workDir.resolve("edges_by_source").resolve("src-part-00000.bin")));
         assertFalse(Files.exists(workDir.resolve("raw_edges.bin")));
-        assertFalse(Files.exists(workDir.resolve("vertex_ids_unsorted.bin")));
-        assertFalse(Files.exists(workDir.resolve("mapping.bin")));
         assertFalse(Files.exists(workDir.resolve("endpoint_refs.bin")));
         assertFalse(Files.exists(workDir.resolve("endpoint_refs.sorted.bin")));
         assertFalse(Files.exists(workDir.resolve("endpoint_assignments.bin")));
@@ -56,14 +54,10 @@ final class GraphPreprocessorTest {
         assertFalse(Files.exists(workDir.resolve("sort")));
 
         try (DiskIntArray outDegree = new DiskIntArray(result.outDegreePath(), result.vertexCount(), result.chunkSize())) {
-            assertEquals(2, outDegree.getInt(0));
-            assertEquals(1, outDegree.getInt(1));
-            assertEquals(1, outDegree.getInt(2));
+            assertArrayEquals(new int[]{2, 1, 1}, readAll(outDegree, result.vertexCount()));
         }
         try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), result.chunkSize())) {
-            assertEquals(10, vertices.getInt(0));
-            assertEquals(20, vertices.getInt(1));
-            assertEquals(30, vertices.getInt(2));
+            assertArrayEquals(new int[]{10, 20, 30}, readAll(vertices, result.vertexCount()));
         }
     }
 
@@ -84,9 +78,7 @@ final class GraphPreprocessorTest {
 
         assertEquals(2, result.edgeCount());
         try (DiskIntArray outDegree = new DiskIntArray(result.outDegreePath(), result.vertexCount(), result.chunkSize())) {
-            assertEquals(2, outDegree.getInt(0));
-            assertEquals(0, outDegree.getInt(1));
-            assertEquals(0, outDegree.getInt(2));
+            assertArrayEquals(new int[]{2, 0, 0}, readAll(outDegree, result.vertexCount()));
         }
     }
 
@@ -102,8 +94,7 @@ final class GraphPreprocessorTest {
 
         assertEquals(2, result.vertexCount());
         try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), result.chunkSize())) {
-            assertEquals(100, vertices.getInt(0));
-            assertEquals(1_000_000, vertices.getInt(1));
+            assertArrayEquals(new int[]{100, 1_000_000}, readAll(vertices, result.vertexCount()));
         }
     }
 
@@ -124,9 +115,7 @@ final class GraphPreprocessorTest {
         assertEquals(3, result.vertexCount());
         assertEquals(2, result.edgeCount());
         try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), result.chunkSize())) {
-            assertEquals(1, vertices.getInt(0));
-            assertEquals(2, vertices.getInt(1));
-            assertEquals(3, vertices.getInt(2));
+            assertArrayEquals(new int[]{1, 2, 3}, readAll(vertices, result.vertexCount()));
         }
     }
 
@@ -154,8 +143,7 @@ final class GraphPreprocessorTest {
 
         assertEquals(2, result.vertexCount());
         try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), result.chunkSize())) {
-            assertEquals(-1, vertices.getInt(0));
-            assertEquals(2, vertices.getInt(1));
+            assertArrayEquals(new int[]{-1, 2}, readAll(vertices, result.vertexCount()));
         }
     }
 
@@ -180,10 +168,11 @@ final class GraphPreprocessorTest {
                 0.85,
                 30,
                 1e-8,
-                AppConfig.IdMode.EXTERNAL_DENSE,
-                0,
-                16L * 1024L * 1024L,
-                false
+                16L * 1024L * 1024L
         );
+    }
+
+    private static int[] readAll(DiskIntArray array, long vertexCount) throws IOException {
+        return array.readIntChunk(0, Math.toIntExact(vertexCount));
     }
 }

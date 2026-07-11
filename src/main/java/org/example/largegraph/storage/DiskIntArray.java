@@ -18,11 +18,6 @@ public final class DiskIntArray implements Closeable {
     private final boolean writable;
     private final boolean forceOnClose;
 
-    private long cachedChunkStart = -1;
-    private int cachedChunkLength;
-    private int[] cachedChunk;
-    private boolean cacheDirty;
-
     public DiskIntArray(Path path, long length, int chunkSize) throws IOException {
         this(path, length, chunkSize, true);
     }
@@ -108,7 +103,6 @@ public final class DiskIntArray implements Closeable {
 
     public void fill(int value) throws IOException {
         ensureWritable();
-        flushCachedChunk();
         channel.truncate(length * BYTES);
         int[] chunk = new int[(int) Math.min(chunkSize, Math.max(1L, length))];
         ByteBuffer scratch = ByteBuffer.allocate(chunk.length * BYTES);
@@ -120,52 +114,9 @@ public final class DiskIntArray implements Closeable {
         flush();
     }
 
-    public int getInt(long id) throws IOException {
-        validateRange(id, 1);
-        ensureCachedChunk(id);
-        return cachedChunk[(int) (id - cachedChunkStart)];
-    }
-
-    public void incrementInt(long id) throws IOException {
-        ensureWritable();
-        validateRange(id, 1);
-        ensureCachedChunk(id);
-        cachedChunk[(int) (id - cachedChunkStart)]++;
-        cacheDirty = true;
-    }
-
     public void flush() throws IOException {
-        flushCachedChunk();
         if (writable) {
             channel.force(false);
-        }
-    }
-
-    public Path path() {
-        return path;
-    }
-
-    public long length() {
-        return length;
-    }
-
-    private void ensureCachedChunk(long id) throws IOException {
-        long chunkStart = (id / chunkSize) * (long) chunkSize;
-        if (chunkStart == cachedChunkStart) {
-            return;
-        }
-        flushCachedChunk();
-        cachedChunkStart = chunkStart;
-        cachedChunkLength = chunkLength(chunkStart);
-        cachedChunk = readIntChunk(chunkStart, cachedChunkLength);
-        cacheDirty = false;
-    }
-
-    private void flushCachedChunk() throws IOException {
-        if (cacheDirty && cachedChunk != null) {
-            ensureWritable();
-            writeIntChunk(cachedChunkStart, cachedChunk, cachedChunkLength);
-            cacheDirty = false;
         }
     }
 
@@ -232,7 +183,6 @@ public final class DiskIntArray implements Closeable {
 
     @Override
     public void close() throws IOException {
-        flushCachedChunk();
         if (forceOnClose) {
             flush();
         }

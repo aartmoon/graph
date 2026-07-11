@@ -15,19 +15,13 @@ public final class ArgsParser {
             "--damping",
             "--max-iterations",
             "--epsilon",
-            "--id-mode",
-            "--top-k",
-            "--scatter-slice-mb",
-            "--keep-messages"
+            "--scatter-slice-mb"
     );
 
     private static final double DEFAULT_DAMPING = 0.85;
     private static final int DEFAULT_MAX_ITERATIONS = 200;
     private static final double DEFAULT_EPSILON = 1e-8;
-    private static final AppConfig.IdMode DEFAULT_ID_MODE = AppConfig.IdMode.EXTERNAL_DENSE;
-    private static final int DEFAULT_TOP_K = 0;
     private static final int DEFAULT_SCATTER_SLICE_MB = 16;
-    private static final boolean DEFAULT_KEEP_MESSAGES = false;
 
     private ArgsParser() {
     }
@@ -45,10 +39,7 @@ public final class ArgsParser {
                 parseDouble(values, "--damping", DEFAULT_DAMPING),
                 parsePositiveInt(values, "--max-iterations", DEFAULT_MAX_ITERATIONS),
                 parseDouble(values, "--epsilon", DEFAULT_EPSILON),
-                values.containsKey("--id-mode") ? AppConfig.IdMode.fromCliValue(values.get("--id-mode")) : DEFAULT_ID_MODE,
-                parseNonNegativeInt(values, "--top-k", DEFAULT_TOP_K),
-                scatterSliceBytes(values),
-                parseBoolean(values, "--keep-messages", DEFAULT_KEEP_MESSAGES)
+                scatterSliceBytes(values)
         );
     }
 
@@ -64,10 +55,7 @@ public final class ArgsParser {
                     --damping 0.85 \\
                     --max-iterations 200 \\
                     --epsilon 1e-8 \\
-                    --id-mode external-dense \\
-                    --top-k 0 \\
-                    --scatter-slice-mb 16 \\
-                    --keep-messages false
+                    --scatter-slice-mb 16
                 """;
     }
 
@@ -120,21 +108,6 @@ public final class ArgsParser {
         }
     }
 
-    private static int parseNonNegativeInt(Map<String, String> values, String option, int defaultValue) {
-        if (!values.containsKey(option)) {
-            return defaultValue;
-        }
-        try {
-            int parsed = Integer.parseInt(values.get(option));
-            if (parsed < 0) {
-                throw new IllegalArgumentException(option + " must be non-negative");
-            }
-            return parsed;
-        } catch (NumberFormatException ex) {
-            throw new IllegalArgumentException(option + " must be an integer", ex);
-        }
-    }
-
     private static double parseDouble(Map<String, String> values, String option, double defaultValue) {
         if (!values.containsKey(option)) {
             return defaultValue;
@@ -148,20 +121,6 @@ public final class ArgsParser {
         } catch (NumberFormatException ex) {
             throw new IllegalArgumentException(option + " must be a number", ex);
         }
-    }
-
-    private static boolean parseBoolean(Map<String, String> values, String option, boolean defaultValue) {
-        if (!values.containsKey(option)) {
-            return defaultValue;
-        }
-        String value = values.get(option);
-        if ("true".equalsIgnoreCase(value)) {
-            return true;
-        }
-        if ("false".equalsIgnoreCase(value)) {
-            return false;
-        }
-        throw new IllegalArgumentException(option + " must be true or false");
     }
 
     private static long scatterSliceBytes(Map<String, String> values) {

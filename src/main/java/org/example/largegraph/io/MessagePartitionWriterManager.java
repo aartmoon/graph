@@ -2,11 +2,12 @@ package org.example.largegraph.io;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeSet;
 
@@ -83,16 +84,17 @@ public final class MessagePartitionWriterManager implements Closeable {
         if (failure != null) {
             throw failure;
         }
-        writeManifest();
     }
 
-    private void writeManifest() throws IOException {
-        Path manifest = workerDir.resolve("manifest.txt");
-        try (var writer = Files.newBufferedWriter(manifest, StandardCharsets.UTF_8)) {
-            for (int bucket : touchedBuckets) {
-                writer.write(Integer.toString(bucket));
-                writer.newLine();
-            }
+    public List<MessageFileInfo> messageFiles() throws IOException {
+        List<MessageFileInfo> files = new ArrayList<>(touchedBuckets.size());
+        for (int bucket : touchedBuckets) {
+            Path path = pathFor(bucket);
+            files.add(new MessageFileInfo(bucket, path, Files.size(path)));
         }
+        return List.copyOf(files);
+    }
+
+    public record MessageFileInfo(int bucket, Path path, long bytes) {
     }
 }

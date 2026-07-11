@@ -21,10 +21,10 @@ from,to
 - X-Stream-style scatter/gather;
 - disk-backed `DiskDoubleArray` и `DiskIntArray`;
 - preprocessing без random disk increment на каждое исходное ребро;
-- message manifest вместо проверки всех `workers * partitions` файлов;
+- scatter передает список созданных message-файлов напрямую в gather;
 - message buckets покрывают непрерывные диапазоны destination partitions;
 - балансировка scatter/gather через очередь задач с тяжелыми slices/buckets первыми;
-- потоковый output и `--top-k` через heap размера K.
+- атомарная запись полного потокового CSV output.
 
 Реализация остается специализированной под PageRank, а не превращается в общий graph framework.
 
@@ -69,20 +69,15 @@ from,to
 Preprocessing:
 
 1. CSV читается потоково.
-2. Пишутся `vertex_ids_unsorted.bin` и `endpoint_refs.bin`.
-3. `vertex_ids_unsorted.bin` сортируется внешней сортировкой по int chunks.
-4. Во время merge выполняется deduplicate.
-5. Пишутся:
-   - `vertices.bin`: `int originalIdByDenseId[denseId]`;
-   - `mapping.bin`: пары `int originalId, int denseId`, отсортированные по `originalId`.
-6. Endpoint references сортируются по `originalId`.
-7. Sort-merge join с `mapping.bin` переписывает endpoints в dense ids.
-8. Endpoint assignments сортируются по `(edgeId, side)`.
-9. Dense edges пишутся во временный stream.
-10. Dense edges сортируются по `(denseFrom, denseTo)` и deduplicate-ятся.
-11. Unique dense edges пишутся в `edges_by_source/src-part-xxxxx.bin`.
-12. После каждого успешного этапа уже ненужные preprocessing intermediates удаляются.
-13. `out_degree.bin`, `rank_current.bin` и `rank_next.bin` создаются после построения graph storage.
+2. Пишется `endpoint_refs.bin`: `originalId, edgeId, side`.
+3. Endpoint references сортируются по `originalId`.
+4. Один последовательный проход назначает dense ids, пишет `vertices.bin` и `endpoint_assignments.bin`.
+5. Endpoint assignments сортируются по `(edgeId, side)`.
+6. Dense edges пишутся во временный stream.
+7. Dense edges сортируются по `(denseFrom, denseTo)` и deduplicate-ятся.
+8. Unique dense edges одним проходом пишутся в `edges_by_source/src-part-xxxxx.bin` и `out_degree.bin`.
+9. После каждого успешного этапа уже ненужные preprocessing intermediates удаляются.
+10. `rank_current.bin` и `rank_next.bin` создаются после построения graph storage.
 
 В heap не создается `HashMap<originalId, denseId>` для всех вершин.
 
@@ -112,7 +107,6 @@ from,to,weight,comment
 
 ```text
 work/
-  meta.properties
   vertices.bin
 
   vertex/
@@ -121,7 +115,6 @@ work/
     rank_next.bin
 
   edges_by_source/
-    source-partitions.tsv
     src-part-00000.bin
     src-part-00001.bin
     ...
@@ -129,7 +122,6 @@ work/
   messages/
     iter-000001/
       worker-00000/
-        manifest.txt
         msg-bucket-00000.bin
         msg-bucket-00007.bin
 ```
@@ -144,22 +136,20 @@ rank files:                 double rank[denseId]
 out_degree.bin:             int outDegree[denseId]
 ```
 
-Во время preprocessing также временно создаются `vertex_ids_unsorted.bin`, `mapping.bin`,
-`endpoint_refs*.bin`, `endpoint_assignments*.bin`, `dense_edges*.bin` и `sort/`. Они удаляются
+Во время preprocessing также временно создаются `endpoint_refs*.bin`,
+`endpoint_assignments*.bin`, `dense_edges*.bin` и `sort/`. Они удаляются
 поэтапно сразу после того, как следующий этап успешно создал свой output.
 
 ## Out-Degree
 
-Out-degree больше не считается через random `incrementInt(from)` при чтении CSV.
-
-После dense rewrite ребра уже лежат по source partitions. Для каждой partition:
+После dense edge sort ребра идут по source order. Для каждой partition:
 
 ```text
 sourceStart = partition * chunkSize
 sourceLength = min(chunkSize, vertexCount - sourceStart)
 ```
 
-Загружается только `int[] outDegreeChunk`, source partition читается потоково, затем chunk записывается обратно в `out_degree.bin`.
+Загружается только `int[] outDegreeChunk`; при записи source partition одновременно считается out-degree и затем chunk записывается в `out_degree.bin`.
 
 ## Итерация PageRank
 
@@ -172,7 +162,7 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 Фаза 1, scatter:
 
 - source partitions сортируются по размеру файла по убыванию;
-- размеры source partitions берутся из `source-partitions.tsv`, metadata не сканируется через `Files.size` на каждой итерации;
+- размеры source partitions передаются из preprocessing result без transient metadata-файла;
 - большие source partitions режутся на bounded byte-aligned edge slices;
 - slices greedily раскладываются в `threads` worker buckets, чтобы тяжелая partition не закреплялась целиком за одним worker;
 - один worker bucket пишет в одну worker directory;
@@ -182,22 +172,18 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 
 Фаза 2, gather:
 
-- каждый worker пишет `manifest.txt` со списком только реально созданных message buckets;
-- gather строит bucket index из manifest-файлов;
-- task создается для каждого непустого диапазона message bucket layout, включая buckets без messages, чтобы каждый destination chunk был перезаписан на итерации;
+- scatter task возвращает список реально созданных message bucket files;
+- gather строит bucket index из этого списка без manifest-файлов;
+- task создается для каждого диапазона message bucket layout, включая buckets без messages, чтобы каждый destination chunk был перезаписан на итерации;
 - buckets сортируются по суммарным message bytes по убыванию;
 - task открывает свой `DiskDoubleArray` для `rank_next.bin` и держит один массив значений для диапазона bucket;
 - chunk впервые инициализируется base value внутри gather task, отдельного полного прохода заполнения `rank_next.bin` нет;
 - запись rank chunk идет через фиксированный небольшой IO buffer, а не через `ByteBuffer` размером со весь bucket;
-- `Files.exists` для всех `workers * partitions` не выполняется.
-
-Фаза 3, convergence:
-
-- `rank_current.bin` и `rank_next.bin` читаются chunk-ами;
-- chunks обрабатываются параллельно worker ranges, затем считается общий `l1Diff` и `rankSum`;
+- task читает соответствующие chunks из `rank_current.bin` и сразу считает локальные `l1Diff` и `rankSum`;
 - если `abs(rankSum - 1.0) > 1e-6` или обнаружен non-finite/negative rank, итерация завершается ошибкой;
-- rank files меняются местами через safer rename sequence с временным файлом и попыткой rollback;
-- messages удаляются после итерации, если `--keep-messages false`.
+- rank files логически меняются местами через swap `Path` references;
+- messages всегда удаляются в `finally` после итерации;
+- `Files.exists` для всех `workers * partitions` не выполняется.
 
 ## Output
 
@@ -211,20 +197,12 @@ vertex,rank
 
 Порядок строк соответствует dense id order, то есть ascending original id для текущего reindexing. Печатаются original ids из `vertices.bin`.
 
-`--top-k K` держит в памяти только min-heap размера K и выводит:
-
-```text
-rank DESC, originalId ASC
-```
-
-`K` ограничен сверху значением `1000000`, чтобы случайно не превратить output phase в heap-heavy сортировку.
-
 ## Memory Model
 
 Heap:
 
 ```text
-O(chunkSize * threads + IO buffers + topK + small metadata)
+O(chunkSize * activeTasks + IO buffers + small metadata)
 ```
 
 Практически heap ближе к:
@@ -239,18 +217,17 @@ O(chunkSize * activeTasks)
 --chunk-size 10000..100000
 ```
 
-Для большего heap `chunk-size` можно увеличивать. Конфигурации, которые требуют impossible heap buffers относительно `Runtime.maxMemory()`, отклоняются на этапе parsing. После preprocessing PageRank дополнительно планирует параллелизм по heap budget: если один task не помещается, запуск отклоняется; если все запрошенные threads не помещаются, runtime уменьшает параллелизм PageRank-фаз.
+Для большего heap `chunk-size` можно увеличивать. Конфигурации, которые требуют impossible Java buffer sizes, отклоняются на этапе parsing. Preprocessing отдельно ограничивает размер sort chunks по heap budget. После preprocessing PageRank планирует параллелизм по heap budget: если один task не помещается, запуск отклоняется; если все запрошенные threads не помещаются, runtime уменьшает параллелизм PageRank-фаз.
 
 External sort chunks имеют internal caps отдельно от PageRank `chunk-size`:
 
 ```text
-int sort chunk <= 500000 ids
 endpoint record sort chunk <= 250000 records
 ```
 
-Vertex id sort dedup-ит значения уже внутри sorted runs и во время intermediate merge. Dense edges сортируются primitive sorter-ом по `(denseFrom, denseTo)` и dedup-ятся во время merge.
+Endpoint refs, endpoint assignments и dense edges сортируются primitive sorters. Dense edges dedup-ятся во время merge.
 
-Runtime warning до preprocessing остается advisory и отдельно показывает `scatterEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate`, `topKEstimate` и `maxHeap`; точный PageRank parallelism выбирается после того, как известны `vertexCount` и bucket layout.
+Точный PageRank parallelism выбирается после того, как известны `vertexCount` и bucket layout.
 
 В heap не хранятся:
 
@@ -272,7 +249,6 @@ messages per iteration: O(E)
 Preprocessing может требовать несколько размеров edge storage во временном диске:
 
 ```text
-vertex_ids_unsorted.bin    O(E)
 endpoint_refs.bin          O(E)
 endpoint_refs.sorted.bin   O(E)
 endpoint_assignments.bin   O(E)
@@ -304,8 +280,7 @@ message record: int,double     = 12 bytes
 - source partitions определяются как `denseFrom / chunkSize`;
 - destination partitions определяются как `denseTo / chunkSize`;
 - duplicate input edges схлопываются после dense rewrite, граф считается unweighted simple directed graph;
-- manifests пишутся sorted by partition id;
-- gather читает worker directories и manifest entries в стабильном порядке;
+- scatter work и message bucket files агрегируются в стабильном порядке;
 - output deterministic для одинакового input/config.
 
 Обычные ограничения floating-point arithmetic остаются.
@@ -359,7 +334,7 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | synthetic-hyper seed=42 | 50,000 | 300,000 | 299,986 | `-Xmx128m` | 10,000 | 4 | 3 | 1.03s | 3.5 MiB | 1.3 MiB | 1.000000000000001 |
 
-`usedHeap` в логах — это Java heap, а не полный RSS процесса. Wall-clock time зависит от SSD/OS cache, но `*.meta.json` рядом с output сохраняет `vertices`, `edges`, `iterations`, `status`, `lastDelta`, `rankSum`, `damping`, `chunkSize`, `threads`.
+`usedHeap` в логах — это Java heap, а не полный RSS процесса. Wall-clock time зависит от SSD/OS cache.
 
 Полный пример:
 
@@ -373,13 +348,10 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
   --damping 0.85 \
   --max-iterations 200 \
   --epsilon 1e-8 \
-  --id-mode external-dense \
-  --top-k 0 \
-  --scatter-slice-mb 16 \
-  --keep-messages false
+  --scatter-slice-mb 16
 ```
 
-`--id-mode external-dense` явно означает external dense reindexing observed ids. `contiguous` сохранен как CLI-совместимый alias.
+External dense reindexing observed ids используется всегда.
 
 ## Synthetic Graph
 
@@ -408,7 +380,7 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 ## Ограничения
 
 - external sort implementation простой: chunk sort + k-way merge;
-- hot-path sort для endpoint refs/assignments/dense edges использует primitive arrays, generic record sorter оставлен как fallback;
+- hot-path sort для endpoint refs/assignments/dense edges использует primitive arrays;
 - sort run metadata хранится как список `Path` для текущего уровня merge; runs сливаются сбалансированными pass-ами с fan-in 128;
 - preprocessing делает несколько disk passes;
 - preprocessing intermediate files удаляются поэтапно после успешного создания следующего файла;

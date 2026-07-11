@@ -3,6 +3,7 @@ package org.example.largegraph.pagerank;
 import org.example.largegraph.config.AppConfig;
 import org.example.largegraph.graph.GraphPreprocessor;
 import org.example.largegraph.io.MessagePartitionWriterManager;
+import org.example.largegraph.io.MessagePartitionWriterManager.MessageFileInfo;
 import org.example.largegraph.storage.DiskDoubleArray;
 import org.example.largegraph.util.MemoryUtils;
 import org.example.largegraph.util.ProgressLogger;
@@ -132,15 +133,17 @@ final class PageRankEngineTest {
     }
 
     @Test
-    void messageManifestContainsOnlyTouchedBucketsSorted() throws IOException {
+    void messageWriterReportsOnlyTouchedBucketsSorted() throws IOException {
         Path workerDir = tempDir.resolve("messages").resolve("worker-00000");
-        try (MessagePartitionWriterManager writers = new MessagePartitionWriterManager(workerDir, 4, 2, 8, 2)) {
-            writers.write(2, 5, 0.25);
-            writers.write(0, 1, 0.75);
-            writers.write(3, 6, 0.5);
-        }
+        List<MessageFileInfo> files;
+        MessagePartitionWriterManager writers = new MessagePartitionWriterManager(workerDir, 4, 2, 8, 2);
+        writers.write(2, 5, 0.25);
+        writers.write(0, 1, 0.75);
+        writers.write(3, 6, 0.5);
+        writers.close();
+        files = writers.messageFiles();
 
-        assertEquals(List.of("0", "2", "3"), Files.readAllLines(workerDir.resolve("manifest.txt")));
+        assertEquals(List.of(0, 2, 3), files.stream().map(MessageFileInfo::bucket).toList());
         assertTrue(Files.exists(workerDir.resolve("msg-bucket-00000.bin")));
         assertTrue(Files.exists(workerDir.resolve("msg-bucket-00002.bin")));
         assertTrue(Files.exists(workerDir.resolve("msg-bucket-00003.bin")));
@@ -205,10 +208,7 @@ final class PageRankEngineTest {
                 0.85,
                 maxIterations,
                 1e-10,
-                AppConfig.IdMode.EXTERNAL_DENSE,
-                0,
-                16L * 1024L * 1024L,
-                false
+                16L * 1024L * 1024L
         );
         GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
         PageRankEngine.PageRankRunResult result = new PageRankEngine(config, new ProgressLogger()).run(graph);

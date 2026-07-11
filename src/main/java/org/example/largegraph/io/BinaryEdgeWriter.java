@@ -19,7 +19,8 @@ public final class BinaryEdgeWriter implements Closeable {
         this.output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(
                 path,
                 StandardOpenOption.CREATE,
-                StandardOpenOption.APPEND
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE
         )));
     }
 
