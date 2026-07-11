@@ -68,6 +68,7 @@ public final class PageRankEngine {
                 Path iterationMessagesDir = messagesDir(iteration);
                 deleteRecursively(iterationMessagesDir);
                 checkMessageDiskSpace(graph, workerCount);
+                IOException primaryFailure = null;
                 try {
                     Files.createDirectories(iterationMessagesDir);
 
@@ -88,8 +89,11 @@ public final class PageRankEngine {
                     Path tmp = currentRankPath;
                     currentRankPath = nextRankPath;
                     nextRankPath = tmp;
+                } catch (IOException ex) {
+                    primaryFailure = ex;
+                    throw ex;
                 } finally {
-                    deleteRecursively(iterationMessagesDir);
+                    cleanupMessages(iterationMessagesDir, primaryFailure);
                 }
                 completedIterations = iteration;
                 logIteration(iteration, lastDiff, lastRankSum, startedAt);
@@ -102,28 +106,19 @@ public final class PageRankEngine {
                             graph.edgeCount(),
                             completedIterations,
                             lastDiff,
-                            lastRankSum,
-                            "CONVERGED"
+                            lastRankSum
                     );
                 }
             }
 
-            return new PageRankRunResult(
-                    currentRankPath,
-                    graph.verticesPath(),
-                    graph.vertexCount(),
-                    graph.edgeCount(),
-                    completedIterations,
-                    lastDiff,
-                    lastRankSum,
-                    "MAX_ITERATIONS_REACHED"
-            );
+            throw new IOException("PageRank did not converge after %d iterations: diff=%.12g epsilon=%.12g"
+                    .formatted(config.maxIterations(), lastDiff, config.epsilon()));
         } finally {
             shutdown(executor);
         }
     }
 
-    private int plannedPageRankThreads(PreprocessingResult graph) {
+    private int plannedPageRankThreads(PreprocessingResult graph) throws IOException {
         long maxHeap = MemoryUtils.maxHeapBytes();
         long availableHeap = Math.max(1L, maxHeap * 65L / 100L);
         long scatterTaskBytes = safeMultiply(graph.chunkSize(), 24L);
@@ -133,7 +128,7 @@ public final class PageRankEngine {
         );
         long perTaskBytes = Math.max(scatterTaskBytes, gatherTaskBytes);
         if (perTaskBytes > availableHeap) {
-            throw new IllegalArgumentException("memory configuration cannot fit one PageRank task: availableHeap=%s requiredPerTask=%s"
+            throw new IOException("memory configuration cannot fit one PageRank task: availableHeap=%s requiredPerTask=%s"
                     .formatted(
                             MemoryUtils.humanReadableBytes(availableHeap),
                             MemoryUtils.humanReadableBytes(perTaskBytes)
@@ -244,7 +239,7 @@ public final class PageRankEngine {
         long edges = 0;
         long messages = 0;
         long bytes = 0;
-        List<MessageFile> messageFiles = new ArrayList<>();
+        List<MessageFileInfo> messageFiles = new ArrayList<>();
         for (ScatterStats stat : stats) {
             edges += stat.edgeCount();
             messages += stat.messageCount();
@@ -266,7 +261,7 @@ public final class PageRankEngine {
         long messageCount = 0;
         Path workerDir = iterationMessagesDir.resolve("worker-%05d".formatted(work.workerId()));
         int maxOpenMessageWriters = maxOpenMessageWritersPerWorker(workerCount);
-        List<MessageFile> messageFiles;
+        List<MessageFileInfo> messageFiles;
 
         try (DiskDoubleArray ranks = new DiskDoubleArray(currentRankPath, graph.vertexCount(), graph.chunkSize(), false);
              DiskIntArray outDegree = new DiskIntArray(graph.outDegreePath(), graph.vertexCount(), graph.chunkSize(), false)) {
@@ -292,9 +287,6 @@ public final class PageRankEngine {
                     outDegree.readIntChunk(sourceStart, outDegreeChunk, 0, sourceLength, degreeScratch);
                     Path sourcePartitionPath = graph.edgesDir()
                             .resolve("src-part-%05d.bin".formatted(sourcePartition));
-                    if (!Files.exists(sourcePartitionPath)) {
-                        continue;
-                    }
 
                     try (FileChannel channel = FileChannel.open(sourcePartitionPath, StandardOpenOption.READ)) {
                         ByteBuffer buffer = ByteBuffer.allocate(EDGE_READ_BUFFER_BYTES);
@@ -316,7 +308,7 @@ public final class PageRankEngine {
                 }
                 messageWriters.close();
                 closed = true;
-                messageFiles = messageFilesFromManager(messageWriters);
+                messageFiles = messageWriters.messageFiles();
             } finally {
                 if (!closed) {
                     try {
@@ -327,17 +319,8 @@ public final class PageRankEngine {
                 }
             }
         }
-        long messageBytes = messageFiles.stream().mapToLong(MessageFile::bytes).sum();
+        long messageBytes = messageFiles.stream().mapToLong(MessageFileInfo::bytes).sum();
         return new ScatterStats(edgeCount, messageCount, messageBytes, messageFiles);
-    }
-
-    private List<MessageFile> messageFilesFromManager(MessagePartitionWriterManager messageWriters) throws IOException {
-        List<MessageFileInfo> files = messageWriters.messageFiles();
-        List<MessageFile> result = new ArrayList<>(files.size());
-        for (MessageFileInfo file : files) {
-            result.add(new MessageFile(file.bucket(), file.path(), file.bytes()));
-        }
-        return List.copyOf(result);
     }
 
     private int maxOpenMessageWritersPerWorker(int workerCount) {
@@ -397,11 +380,11 @@ public final class PageRankEngine {
             PreprocessingResult graph,
             Path currentRankPath,
             Path nextRankPath,
-            List<MessageFile> messageFiles,
+            List<MessageFileInfo> messageFiles,
             double base,
             ExecutorService executor
     ) throws IOException {
-        Map<Integer, List<MessageFile>> messageIndex = buildMessageBucketIndex(messageFiles);
+        Map<Integer, List<MessageFileInfo>> messageIndex = buildMessageBucketIndex(messageFiles);
         MessageBucketLayout bucketLayout = new MessageBucketLayout(
                 graph.destinationPartitionCount(),
                 graph.chunkSize(),
@@ -411,8 +394,17 @@ public final class PageRankEngine {
 
         List<Callable<GatherStats>> tasks = new ArrayList<>(bucketLayout.bucketCount());
         for (int bucket : bucketsByDescendingMessageBytes(bucketLayout, messageIndex)) {
-            List<MessageFile> messageFiles = messageIndex.getOrDefault(bucket, List.of());
-            addGatherTasks(tasks, graph, currentRankPath, nextRankPath, bucketLayout, bucket, messageFiles, base);
+            List<MessageFileInfo> bucketMessageFiles = messageIndex.getOrDefault(bucket, List.of());
+            tasks.add(() -> gatherBucketRange(
+                    graph,
+                    currentRankPath,
+                    nextRankPath,
+                    bucket,
+                    bucketLayout.firstDenseVertexId(bucket),
+                    bucketLayout.endDenseVertexIdExclusive(bucket),
+                    bucketMessageFiles,
+                    base
+            ));
         }
         List<GatherStats> stats = invokeAll(executor, tasks);
         long messages = 0;
@@ -427,28 +419,6 @@ public final class PageRankEngine {
         return new GatherStats(messages, l1Diff, rankSum);
     }
 
-    private void addGatherTasks(
-            List<Callable<GatherStats>> tasks,
-            PreprocessingResult graph,
-            Path currentRankPath,
-            Path nextRankPath,
-            MessageBucketLayout bucketLayout,
-            int bucket,
-            List<MessageFile> messageFiles,
-            double base
-    ) {
-        tasks.add(() -> gatherBucketRange(
-                graph,
-                currentRankPath,
-                nextRankPath,
-                bucket,
-                bucketLayout.firstDenseVertexId(bucket),
-                bucketLayout.endDenseVertexIdExclusive(bucket),
-                messageFiles,
-                base
-        ));
-    }
-
     private GatherStats gatherBucketRange(
             PreprocessingResult graph,
             Path currentRankPath,
@@ -456,7 +426,7 @@ public final class PageRankEngine {
             int bucket,
             long rangeStart,
             long rangeEndExclusive,
-            List<MessageFile> messageFiles,
+            List<MessageFileInfo> messageFiles,
             double base
     ) throws IOException {
         long messageCount = 0;
@@ -468,7 +438,7 @@ public final class PageRankEngine {
 
         try (DiskDoubleArray currentRanks = new DiskDoubleArray(currentRankPath, graph.vertexCount(), graph.chunkSize(), false);
              DiskDoubleArray nextRanks = new DiskDoubleArray(nextRankPath, graph.vertexCount(), graph.chunkSize(), true, false)) {
-            for (MessageFile messageFile : messageFiles) {
+            for (MessageFileInfo messageFile : messageFiles) {
                 try (BinaryMessageReader reader = new BinaryMessageReader(messageFile.path())) {
                     while (reader.next()) {
                         int to = reader.to();
@@ -539,16 +509,12 @@ public final class PageRankEngine {
     }
 
     private List<SourcePartitionSlice> readNonEmptySourcePartitionSlices(PreprocessingResult graph) throws IOException {
+        validateSourceSliceBudget(graph);
         List<SourcePartitionSlice> slices = new ArrayList<>();
-        int expectedPartition = 0;
+        int previousPartition = -1;
         for (var info : graph.sourcePartitions()) {
-            expectedPartition = readSourcePartitionInfo(graph, slices, info, expectedPartition);
+            previousPartition = readSourcePartitionInfo(graph, slices, info, previousPartition);
         }
-        if (expectedPartition != graph.sourcePartitionCount()) {
-            throw new IOException("source partition metadata row count mismatch: expected=%d actual=%d"
-                    .formatted(graph.sourcePartitionCount(), expectedPartition));
-        }
-        validateNoUnexpectedSourcePartitionFiles(graph);
         return slices;
     }
 
@@ -556,14 +522,13 @@ public final class PageRankEngine {
             PreprocessingResult graph,
             List<SourcePartitionSlice> slices,
             org.example.largegraph.graph.GraphPreprocessor.SourcePartitionInfo info,
-            int expectedPartition
+            int previousPartition
     ) throws IOException {
         int partition = info.partition();
-        long metadataEdges = info.edges();
         long bytes = info.bytes();
-        if (partition != expectedPartition) {
-            throw new IOException("source partition metadata out of order: expected=%d actual=%d"
-                    .formatted(expectedPartition, partition));
+        if (partition <= previousPartition) {
+            throw new IOException("source partition metadata out of order: previous=%d actual=%d"
+                    .formatted(previousPartition, partition));
         }
         if (partition < 0 || partition >= graph.sourcePartitionCount()) {
             throw new IOException("source partition metadata out of range: " + partition);
@@ -573,12 +538,8 @@ public final class PageRankEngine {
                     .formatted(partition, bytes));
         }
         long edgeCount = bytes / EDGE_RECORD_BYTES;
-        if (metadataEdges != edgeCount) {
-            throw new IOException("source partition edge count mismatch: partition=%d edges=%d bytes=%d"
-                    .formatted(partition, metadataEdges, bytes));
-        }
         Path partitionPath = graph.edgesDir().resolve("src-part-%05d.bin".formatted(partition));
-        long actualBytes = Files.exists(partitionPath) ? Files.size(partitionPath) : 0L;
+        long actualBytes = Files.size(partitionPath);
         if (actualBytes != bytes) {
             throw new IOException("source partition file size mismatch: partition=%d metadataBytes=%d actualBytes=%d"
                     .formatted(partition, bytes, actualBytes));
@@ -586,26 +547,7 @@ public final class PageRankEngine {
         if (bytes > 0) {
             addSourcePartitionSlices(slices, partition, bytes);
         }
-        return expectedPartition + 1;
-    }
-
-    private void validateNoUnexpectedSourcePartitionFiles(PreprocessingResult graph) throws IOException {
-        try (var paths = Files.list(graph.edgesDir())) {
-            for (Path path : paths.toList()) {
-                String fileName = path.getFileName().toString();
-                if (fileName.startsWith("src-part-") && fileName.endsWith(".bin")) {
-                    int partition;
-                    try {
-                        partition = Integer.parseInt(fileName.substring("src-part-".length(), fileName.length() - ".bin".length()));
-                    } catch (NumberFormatException ex) {
-                        throw new IOException("invalid source partition file name: " + path, ex);
-                    }
-                    if (partition < 0 || partition >= graph.sourcePartitionCount()) {
-                        throw new IOException("unexpected source partition file: " + path);
-                    }
-                }
-            }
-        }
+        return partition;
     }
 
     private void addSourcePartitionSlices(List<SourcePartitionSlice> slices, int partition, long bytes) throws IOException {
@@ -626,9 +568,30 @@ public final class PageRankEngine {
         }
     }
 
+    private void validateSourceSliceBudget(PreprocessingResult graph) throws IOException {
+        long sliceCount = 0;
+        for (var info : graph.sourcePartitions()) {
+            long alignedSliceBytes = config.scatterSliceBytes() - (config.scatterSliceBytes() % EDGE_RECORD_BYTES);
+            if (alignedSliceBytes == 0) {
+                alignedSliceBytes = EDGE_RECORD_BYTES;
+            }
+            sliceCount = safeAdd(sliceCount, Math.ceilDiv(info.bytes(), alignedSliceBytes));
+        }
+        long estimatedMetadataBytes = safeMultiply(sliceCount, 56L);
+        long metadataBudget = Math.max(1L, MemoryUtils.maxHeapBytes() / 10L);
+        if (estimatedMetadataBytes > metadataBudget) {
+            throw new IOException("too many source slices for heap; increase --scatter-slice-mb or --chunk-size: slices=%d estimatedMetadata=%s budget=%s"
+                    .formatted(
+                            sliceCount,
+                            MemoryUtils.humanReadableBytes(estimatedMetadataBytes),
+                            MemoryUtils.humanReadableBytes(metadataBudget)
+                    ));
+        }
+    }
+
     private List<Integer> bucketsByDescendingMessageBytes(
             MessageBucketLayout bucketLayout,
-            Map<Integer, List<MessageFile>> messageIndex
+            Map<Integer, List<MessageFileInfo>> messageIndex
     ) {
         List<Integer> buckets = new ArrayList<>(bucketLayout.bucketCount());
         for (int bucket = 0; bucket < bucketLayout.bucketCount(); bucket++) {
@@ -638,16 +601,16 @@ public final class PageRankEngine {
                 .comparingLong((Integer bucket) -> messageIndex
                         .getOrDefault(bucket, List.of())
                         .stream()
-                        .mapToLong(MessageFile::bytes)
+                        .mapToLong(MessageFileInfo::bytes)
                         .sum())
                 .reversed()
                 .thenComparingInt(Integer::intValue));
         return buckets;
     }
 
-    private Map<Integer, List<MessageFile>> buildMessageBucketIndex(List<MessageFile> messageFiles) throws IOException {
-        Map<Integer, List<MessageFile>> index = new HashMap<>();
-        for (MessageFile messageFile : messageFiles) {
+    private Map<Integer, List<MessageFileInfo>> buildMessageBucketIndex(List<MessageFileInfo> messageFiles) throws IOException {
+        Map<Integer, List<MessageFileInfo>> index = new HashMap<>();
+        for (MessageFileInfo messageFile : messageFiles) {
             if (messageFile.bytes() % (Integer.BYTES + Double.BYTES) != 0) {
                 throw new IOException("message file is not record-aligned: " + messageFile.path());
             }
@@ -680,7 +643,7 @@ public final class PageRankEngine {
     }
 
     private void validateMessageBuckets(
-            Map<Integer, List<MessageFile>> messageIndex,
+            Map<Integer, List<MessageFileInfo>> messageIndex,
             MessageBucketLayout bucketLayout
     ) throws IOException {
         for (int bucket : messageIndex.keySet()) {
@@ -791,6 +754,18 @@ public final class PageRankEngine {
         FileUtils.deleteRecursively(path);
     }
 
+    private void cleanupMessages(Path path, IOException primaryFailure) throws IOException {
+        try {
+            deleteRecursively(path);
+        } catch (IOException cleanupFailure) {
+            if (primaryFailure != null) {
+                primaryFailure.addSuppressed(cleanupFailure);
+            } else {
+                throw cleanupFailure;
+            }
+        }
+    }
+
     private long safeMultiply(long left, long right) {
         try {
             return Math.multiplyExact(left, right);
@@ -814,18 +789,14 @@ public final class PageRankEngine {
             long edgeCount,
             int iterations,
             double lastDelta,
-            double rankSum,
-            String status
+            double rankSum
     ) {
     }
 
-    private record ScatterStats(long edgeCount, long messageCount, long messageBytes, List<MessageFile> messageFiles) {
+    private record ScatterStats(long edgeCount, long messageCount, long messageBytes, List<MessageFileInfo> messageFiles) {
     }
 
     private record GatherStats(long messageCount, double l1Diff, double rankSum) {
-    }
-
-    private record MessageFile(int bucket, Path path, long bytes) {
     }
 
     private record ChunkRange(long startId, long endIdExclusive) {

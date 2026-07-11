@@ -24,7 +24,7 @@ from,to
 - scatter передает список созданных message-файлов напрямую в gather;
 - message buckets покрывают непрерывные диапазоны destination partitions;
 - балансировка scatter/gather через очередь задач с тяжелыми slices/buckets первыми;
-- атомарная запись полного потокового CSV output.
+- потоковая запись полного CSV во временный sibling-файл с atomic move, если filesystem его поддерживает.
 
 Реализация остается специализированной под PageRank, а не превращается в общий graph framework.
 
@@ -77,7 +77,7 @@ Preprocessing:
 7. Dense edges сортируются по `(denseFrom, denseTo)` и deduplicate-ятся.
 8. Unique dense edges одним проходом пишутся в `edges_by_source/src-part-xxxxx.bin` и `out_degree.bin`.
 9. После каждого успешного этапа уже ненужные preprocessing intermediates удаляются.
-10. `rank_current.bin` и `rank_next.bin` создаются после построения graph storage.
+10. `rank_current.bin` создаётся после построения graph storage; `rank_next.bin` полностью создаёт gather на первой итерации.
 
 В heap не создается `HashMap<originalId, denseId>` для всех вершин.
 
@@ -112,7 +112,7 @@ work/
   vertex/
     out_degree.bin
     rank_current.bin
-    rank_next.bin
+    rank_next.bin        # появляется во время PageRank iterations
 
   edges_by_source/
     src-part-00000.bin
@@ -384,6 +384,7 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 - sort run metadata хранится как список `Path` для текущего уровня merge; runs сливаются сбалансированными pass-ами с fan-in 128;
 - preprocessing делает несколько disk passes;
 - preprocessing intermediate files удаляются поэтапно после успешного создания следующего файла;
+- managed workdir files удаляются после успешной записи CSV, потому что resume/reuse не реализованы;
 - messages занимают `O(E)` временного места на каждой итерации: на каждое ребро пишется record `int denseTo,double contribution` при наличии исходящей степени;
 - число unique observed vertices должно помещаться в `int denseId`;
 - `partitionCount = ceil(V / chunkSize)` должен помещаться в `int`;

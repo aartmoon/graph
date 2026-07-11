@@ -171,7 +171,7 @@ public final class DiskIntArray implements Closeable {
         }
     }
 
-    private synchronized void writeFully(ByteBuffer buffer, long position) throws IOException {
+    private void writeFully(ByteBuffer buffer, long position) throws IOException {
         while (buffer.hasRemaining()) {
             int written = channel.write(buffer, position);
             if (written == 0) {

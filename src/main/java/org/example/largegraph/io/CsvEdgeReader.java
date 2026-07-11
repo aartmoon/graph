@@ -48,10 +48,10 @@ public final class CsvEdgeReader implements Closeable {
         return to;
     }
 
-    private void parseEdge(String line) {
+    private void parseEdge(String line) throws IOException {
         int comma = line.indexOf(',');
         if (comma < 0) {
-            throw new IllegalArgumentException("invalid CSV edge at line " + lineNumber
+            throw new IOException("invalid CSV edge at line " + lineNumber
                     + ": expected at least two columns: " + line);
         }
         int secondComma = line.indexOf(',', comma + 1);
@@ -59,13 +59,13 @@ public final class CsvEdgeReader implements Closeable {
         String fromText = line.substring(0, comma).trim();
         String toText = line.substring(comma + 1, toEnd).trim();
         if (fromText.isEmpty() || toText.isEmpty()) {
-            throw new IllegalArgumentException("empty vertex id at line " + lineNumber + ": " + line);
+            throw new IOException("empty vertex id at line " + lineNumber + ": " + line);
         }
         try {
             from = Integer.parseInt(fromText);
             to = Integer.parseInt(toText);
         } catch (NumberFormatException ex) {
-            throw new IllegalArgumentException("invalid int32 vertex id at line " + lineNumber + ": " + line, ex);
+            throw new IOException("invalid int32 vertex id at line " + lineNumber + ": " + line, ex);
         }
     }
 

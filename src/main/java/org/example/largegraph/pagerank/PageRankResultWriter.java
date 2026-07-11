@@ -9,6 +9,7 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileStore;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -26,6 +27,7 @@ public final class PageRankResultWriter {
         if (config.output().getParent() != null) {
             Files.createDirectories(config.output().getParent());
         }
+        checkOutputDiskSpace(result);
         Path tempOutput = temporarySibling(config.output());
         boolean moved = false;
         try {
@@ -70,11 +72,38 @@ public final class PageRankResultWriter {
         return parent == null ? Path.of(tempName) : parent.resolve(tempName);
     }
 
+    private void checkOutputDiskSpace(PageRankRunResult result) throws IOException {
+        Path outputDir = config.output().getParent() == null ? Path.of(".") : config.output().getParent();
+        FileStore store = Files.getFileStore(outputDir);
+        long estimatedBytes = saturatingAdd(saturatingMultiply(result.vertexCount(), 64L), 1024L * 1024L);
+        long free = store.getUsableSpace();
+        if (free < estimatedBytes) {
+            throw new IOException("not enough disk space for output CSV: free=%d estimatedRequired=%d"
+                    .formatted(free, estimatedBytes));
+        }
+    }
+
     private void moveReplacing(Path source, Path target) throws IOException {
         try {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (AtomicMoveNotSupportedException ex) {
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private long saturatingMultiply(long left, long right) {
+        try {
+            return Math.multiplyExact(left, right);
+        } catch (ArithmeticException ex) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    private long saturatingAdd(long left, long right) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException ex) {
+            return Long.MAX_VALUE;
         }
     }
 

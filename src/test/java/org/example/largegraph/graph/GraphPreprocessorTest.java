@@ -42,7 +42,7 @@ final class GraphPreprocessorTest {
         assertTrue(Files.exists(workDir.resolve("vertices.bin")));
         assertTrue(Files.exists(workDir.resolve("vertex").resolve("out_degree.bin")));
         assertTrue(Files.exists(workDir.resolve("vertex").resolve("rank_current.bin")));
-        assertTrue(Files.exists(workDir.resolve("vertex").resolve("rank_next.bin")));
+        assertFalse(Files.exists(workDir.resolve("vertex").resolve("rank_next.bin")));
         assertTrue(Files.exists(workDir.resolve("edges_by_source").resolve("src-part-00000.bin")));
         assertFalse(Files.exists(workDir.resolve("raw_edges.bin")));
         assertFalse(Files.exists(workDir.resolve("endpoint_refs.bin")));
@@ -154,7 +154,7 @@ final class GraphPreprocessorTest {
 
         AppConfig config = config(input, tempDir.resolve("out.csv"), tempDir.resolve("work"), 4, 2);
 
-        assertThrows(IllegalArgumentException.class,
+        assertThrows(IOException.class,
                 () -> new GraphPreprocessor(config, new ProgressLogger()).preprocess());
     }
 

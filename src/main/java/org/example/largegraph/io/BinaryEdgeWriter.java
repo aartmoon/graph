@@ -10,7 +10,6 @@ import java.nio.file.StandardOpenOption;
 
 public final class BinaryEdgeWriter implements Closeable {
     private final DataOutputStream output;
-    private long edgeCount;
 
     public BinaryEdgeWriter(Path path) throws IOException {
         if (path.getParent() != null) {
@@ -27,11 +26,6 @@ public final class BinaryEdgeWriter implements Closeable {
     public void write(int denseFrom, int denseTo) throws IOException {
         output.writeInt(denseFrom);
         output.writeInt(denseTo);
-        edgeCount++;
-    }
-
-    public long edgeCount() {
-        return edgeCount;
     }
 
     @Override

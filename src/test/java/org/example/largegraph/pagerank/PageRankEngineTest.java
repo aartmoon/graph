@@ -207,7 +207,7 @@ final class PageRankEngineTest {
                 4,
                 0.85,
                 maxIterations,
-                1e-10,
+                Double.MAX_VALUE,
                 16L * 1024L * 1024L
         );
         GraphPreprocessor.PreprocessingResult graph = new GraphPreprocessor(config, new ProgressLogger()).preprocess();

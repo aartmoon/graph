@@ -136,14 +136,6 @@ public final class DiskDoubleArray implements Closeable {
         }
     }
 
-    public Path path() {
-        return path;
-    }
-
-    public long length() {
-        return length;
-    }
-
     private int chunkLength(long startId) {
         return (int) Math.min(chunkSize, length - startId);
     }
@@ -195,7 +187,7 @@ public final class DiskDoubleArray implements Closeable {
         }
     }
 
-    private synchronized void writeFully(ByteBuffer buffer, long position) throws IOException {
+    private void writeFully(ByteBuffer buffer, long position) throws IOException {
         while (buffer.hasRemaining()) {
             int written = channel.write(buffer, position);
             if (written == 0) {

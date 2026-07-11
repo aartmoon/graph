@@ -48,7 +48,6 @@ public record AppConfig(
         }
         validateBufferSize("--chunk-size for double chunks", chunkSize, Double.BYTES);
         validateBufferSize("--chunk-size for int chunks", chunkSize, Integer.BYTES);
-        validateBufferSize("--scatter-slice-mb", scatterSliceBytes, 1);
     }
 
     private static void validateBufferSize(String option, long itemCount, int bytesPerItem) {

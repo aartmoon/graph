@@ -10,7 +10,6 @@ import java.nio.file.StandardOpenOption;
 
 public final class BinaryMessageWriter implements Closeable {
     private final DataOutputStream output;
-    private long messageCount;
 
     public BinaryMessageWriter(Path path) throws IOException {
         if (path.getParent() != null) {
@@ -26,11 +25,6 @@ public final class BinaryMessageWriter implements Closeable {
     public void write(int to, double contribution) throws IOException {
         output.writeInt(to);
         output.writeDouble(contribution);
-        messageCount++;
-    }
-
-    public long messageCount() {
-        return messageCount;
     }
 
     @Override
