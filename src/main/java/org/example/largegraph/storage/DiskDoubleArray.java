@@ -41,24 +41,6 @@ public final class DiskDoubleArray implements Closeable {
                 : FileChannel.open(path, StandardOpenOption.READ);
     }
 
-    public double[] readChunk(long startId, int requestedLength) throws IOException {
-        validateRange(startId, requestedLength);
-        ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
-        return readChunk(startId, requestedLength, buffer);
-    }
-
-    public double[] readChunk(long startId, int requestedLength, ByteBuffer scratch) throws IOException {
-        validateRange(startId, requestedLength);
-        double[] values = new double[requestedLength];
-        readChunk(startId, values, 0, requestedLength, scratch);
-        return values;
-    }
-
-    public void readChunk(long startId, double[] target, int targetOffset, int requestedLength) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
-        readChunk(startId, target, targetOffset, requestedLength, buffer);
-    }
-
     public void readChunk(
             long startId,
             double[] target,
@@ -102,30 +84,14 @@ public final class DiskDoubleArray implements Closeable {
         }
     }
 
-    public void writeChunk(long startId, double[] values, int requestedLength, ByteBuffer scratch) throws IOException {
-        ensureWritable();
-        validateRange(startId, requestedLength);
-        if (values.length < requestedLength) {
-            throw new IllegalArgumentException("values array is shorter than requested length");
-        }
-        ensureScratchCapacity(scratch, requestedLength);
-        ByteBuffer buffer = prepareScratch(scratch, requestedLength);
-        for (int i = 0; i < requestedLength; i++) {
-            buffer.putDouble(values[i]);
-        }
-        buffer.flip();
-        writeFully(buffer, startId * BYTES);
-    }
-
     public void fill(double value) throws IOException {
         ensureWritable();
         channel.truncate(length * BYTES);
         double[] chunk = new double[(int) Math.min(chunkSize, Math.max(1L, length))];
-        ByteBuffer scratch = ByteBuffer.allocate(chunk.length * BYTES);
         java.util.Arrays.fill(chunk, value);
         for (long start = 0; start < length; start += chunkSize) {
             int len = chunkLength(start);
-            writeChunk(start, chunk, len, scratch);
+            writeChunk(start, chunk, len);
         }
         flush();
     }

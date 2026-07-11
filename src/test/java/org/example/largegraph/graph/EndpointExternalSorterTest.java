@@ -82,7 +82,7 @@ final class EndpointExternalSorterTest {
     @Test
     void denseEdgeSorterOrdersAndDeduplicatesPrimitiveRunsAndMergePasses() throws IOException {
         Path input = tempDir.resolve("dense_edges.bin");
-        Path output = tempDir.resolve("dense_edges.sorted.bin");
+        Path output = tempDir.resolve("dense_edges.unique.bin");
         List<DenseEdgeRecord> records = new ArrayList<>();
         for (int i = 99; i >= 0; i--) {
             records.add(new DenseEdgeRecord(i % 13, i % 7));

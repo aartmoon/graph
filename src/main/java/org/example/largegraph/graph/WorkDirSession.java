@@ -80,7 +80,6 @@ public final class WorkDirSession implements Closeable {
         Files.deleteIfExists(workDir.resolve("endpoint_assignments.bin"));
         Files.deleteIfExists(workDir.resolve("endpoint_assignments.sorted.bin"));
         Files.deleteIfExists(workDir.resolve("dense_edges.bin"));
-        Files.deleteIfExists(workDir.resolve("dense_edges.sorted.bin"));
     }
 
     @Override

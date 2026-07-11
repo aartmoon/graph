@@ -254,7 +254,6 @@ endpoint_refs.sorted.bin   O(E)
 endpoint_assignments.bin   O(E)
 endpoint_assignments.sorted.bin O(E)
 dense_edges.bin            O(E)
-dense_edges.sorted.bin     O(E)
 sort runs                  O(E + V)
 edges_by_source            O(E)
 ```

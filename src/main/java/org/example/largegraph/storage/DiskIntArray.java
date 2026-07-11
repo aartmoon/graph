@@ -16,46 +16,22 @@ public final class DiskIntArray implements Closeable {
     private final int chunkSize;
     private final FileChannel channel;
     private final boolean writable;
-    private final boolean forceOnClose;
 
     public DiskIntArray(Path path, long length, int chunkSize) throws IOException {
         this(path, length, chunkSize, true);
     }
 
     public DiskIntArray(Path path, long length, int chunkSize, boolean writable) throws IOException {
-        this(path, length, chunkSize, writable, true);
-    }
-
-    public DiskIntArray(Path path, long length, int chunkSize, boolean writable, boolean forceOnClose) throws IOException {
         this.path = path;
         this.length = length;
         this.chunkSize = chunkSize;
         this.writable = writable;
-        this.forceOnClose = forceOnClose;
         if (writable && path.getParent() != null) {
             Files.createDirectories(path.getParent());
         }
         this.channel = writable
                 ? FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
                 : FileChannel.open(path, StandardOpenOption.READ);
-    }
-
-    public int[] readIntChunk(long startId, int requestedLength) throws IOException {
-        validateRange(startId, requestedLength);
-        ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
-        return readIntChunk(startId, requestedLength, buffer);
-    }
-
-    public int[] readIntChunk(long startId, int requestedLength, ByteBuffer scratch) throws IOException {
-        validateRange(startId, requestedLength);
-        int[] values = new int[requestedLength];
-        readIntChunk(startId, values, 0, requestedLength, scratch);
-        return values;
-    }
-
-    public void readIntChunk(long startId, int[] target, int targetOffset, int requestedLength) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
-        readIntChunk(startId, target, targetOffset, requestedLength, buffer);
     }
 
     public void readIntChunk(
@@ -74,16 +50,6 @@ public final class DiskIntArray implements Closeable {
         for (int i = 0; i < requestedLength; i++) {
             target[targetOffset + i] = buffer.getInt();
         }
-    }
-
-    public void writeIntChunk(long startId, int[] values, int requestedLength) throws IOException {
-        ensureWritable();
-        validateRange(startId, requestedLength);
-        if (values.length < requestedLength) {
-            throw new IllegalArgumentException("values array is shorter than requested length");
-        }
-        ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
-        writeIntChunk(startId, values, requestedLength, buffer);
     }
 
     public void writeIntChunk(long startId, int[] values, int requestedLength, ByteBuffer scratch) throws IOException {
@@ -183,9 +149,7 @@ public final class DiskIntArray implements Closeable {
 
     @Override
     public void close() throws IOException {
-        if (forceOnClose) {
-            flush();
-        }
+        flush();
         channel.close();
     }
 }

@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -217,7 +218,10 @@ final class PageRankEngineTest {
 
     private static double[] readAllRanks(PageRankEngine.PageRankRunResult result) throws IOException {
         try (DiskDoubleArray ranks = new DiskDoubleArray(result.rankPath(), result.vertexCount(), 1_024)) {
-            return ranks.readChunk(0, Math.toIntExact(result.vertexCount()));
+            int length = Math.toIntExact(result.vertexCount());
+            double[] values = new double[length];
+            ranks.readChunk(0, values, 0, length, ByteBuffer.allocate(length * Double.BYTES));
+            return values;
         }
     }
 
@@ -226,7 +230,8 @@ final class PageRankEngineTest {
         try (DiskDoubleArray ranks = new DiskDoubleArray(result.rankPath(), result.vertexCount(), 1_024, false)) {
             for (long start = 0; start < result.vertexCount(); start += 1_024) {
                 int length = (int) Math.min(1_024, result.vertexCount() - start);
-                double[] chunk = ranks.readChunk(start, length);
+                double[] chunk = new double[length];
+                ranks.readChunk(start, chunk, 0, length, ByteBuffer.allocate(length * Double.BYTES));
                 for (double value : chunk) {
                     sum += value;
                 }

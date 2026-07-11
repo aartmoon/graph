@@ -1,7 +1,6 @@
 package org.example.largegraph.graph;
 
 import org.example.largegraph.config.AppConfig;
-import org.example.largegraph.io.BinaryEdgeReader;
 import org.example.largegraph.io.BinaryEdgeWriter;
 import org.example.largegraph.io.CsvEdgeReader;
 import org.example.largegraph.storage.DiskDoubleArray;
@@ -55,23 +54,16 @@ public final class GraphPreprocessor {
             long vertexCount = rewriteStats.vertexCount();
             int partitionCount = partitionCount(vertexCount);
             validatePartitionMetadataBudget(partitionCount);
-            checkSourceAndRankFreeDiskSpace(vertexCount, rewriteStats.storedEdges());
-            SourceStorageStats sourceStorage = buildSourceStorageAndOutDegree(vertexCount, partitionCount);
-            if (sourceStorage.edgeCount() != rewriteStats.storedEdges()) {
-                throw new IOException("source storage edge count mismatch: expected=%d actual=%d"
-                        .formatted(rewriteStats.storedEdges(), sourceStorage.edgeCount()));
-            }
+            checkSourceAndRankFreeDiskSpace(vertexCount, rewriteStats.reconstructedInputEdges());
+            SourceStorageStats sourceStorage = sortDenseEdgesToSourceStorage(vertexCount, partitionCount);
             createAndInitializeRankFiles(vertexCount);
 
             logger.info("Preprocessing finished: vertices=%d inputEdges=%d storedEdges=%d sourcePartitions=%d"
-                    .formatted(vertexCount, stats.edgeCount(), rewriteStats.storedEdges(), partitionCount));
+                    .formatted(vertexCount, stats.edgeCount(), sourceStorage.edgeCount(), partitionCount));
             success = true;
             return new PreprocessingResult(
                     vertexCount,
-                    rewriteStats.storedEdges(),
-                    partitionCount,
-                    partitionCount,
-                    config.chunkSize(),
+                    sourceStorage.edgeCount(),
                     outDegreePath(),
                     rankCurrentPath(),
                     rankNextPath(),
@@ -137,20 +129,8 @@ public final class GraphPreprocessor {
         long reconstructedInputEdges = writeDenseEdges();
         Files.deleteIfExists(endpointAssignmentsSortedPath());
 
-        logger.info("Sorting and deduplicating dense edges");
-        ensureSpaceForExternalSort(denseEdgesPath(), "dense edge sort");
-        new DenseEdgeExternalSorter(recordSortChunkSize()).sortUnique(
-                denseEdgesPath(),
-                denseEdgesSortedPath(),
-                config.workDir().resolve("sort").resolve("dense-edges"),
-                "dense-edge-run"
-        );
-        Files.deleteIfExists(denseEdgesPath());
-        deleteRecursively(config.workDir().resolve("sort"));
-
-        long storedEdges = Files.size(denseEdgesSortedPath()) / (Integer.BYTES * 2L);
-        logger.info("Dense edge rewrite finished: vertices=%d storedEdges=%d".formatted(vertexCount, storedEdges));
-        return new RewriteStats(vertexCount, reconstructedInputEdges, storedEdges);
+        logger.info("Dense edge rewrite finished: vertices=%d inputEdges=%d".formatted(vertexCount, reconstructedInputEdges));
+        return new RewriteStats(vertexCount, reconstructedInputEdges);
     }
 
     private long writeVerticesAndEndpointAssignments() throws IOException {
@@ -184,99 +164,34 @@ public final class GraphPreprocessor {
         return vertexCount;
     }
 
-    private SourceStorageStats buildSourceStorageAndOutDegree(long vertexCount, int partitionCount) throws IOException {
-        logger.info("Writing dense source partitions and out-degree");
-        List<SourcePartitionInfo> sourcePartitions = new ArrayList<>();
-        long edgeCount = 0;
-        boolean hasNextEdge;
-
-        try (BinaryEdgeReader reader = new BinaryEdgeReader(denseEdgesSortedPath());
-             DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize())) {
-            int[] outDegreeChunk = new int[config.chunkSize()];
-            ByteBuffer scratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
-            hasNextEdge = reader.next();
-            for (int partition = 0; partition < partitionCount; partition++) {
-                long sourceStart = (long) partition * config.chunkSize();
-                long sourceEnd = Math.min(vertexCount, sourceStart + config.chunkSize());
-                int sourceLength = (int) (sourceEnd - sourceStart);
-                Arrays.fill(outDegreeChunk, 0, sourceLength, 0);
-
-                PartitionWriteResult result = writeSourcePartition(
-                        reader,
-                        hasNextEdge,
-                        partition,
-                        sourceStart,
-                        sourceEnd,
-                        outDegreeChunk
-                );
-                hasNextEdge = result.hasNextEdge();
-                edgeCount += result.edgeCount();
-                outDegree.writeIntChunk(sourceStart, outDegreeChunk, sourceLength, scratch);
-                if (result.edgeCount() > 0) {
-                    sourcePartitions.add(new SourcePartitionInfo(
-                            partition,
-                            result.edgeCount() * Integer.BYTES * 2L
-                    ));
-                }
-                logProgress("dense-dedup-write", edgeCount);
-            }
-            if (hasNextEdge) {
-                throw new IOException("dense edge source partition out of range: " + reader.denseFrom());
-            }
-        }
-        Files.deleteIfExists(denseEdgesSortedPath());
-        return new SourceStorageStats(edgeCount, List.copyOf(sourcePartitions));
-    }
-
-    private PartitionWriteResult writeSourcePartition(
-            BinaryEdgeReader reader,
-            boolean hasFirstEdge,
-            int partition,
-            long sourceStart,
-            long sourceEnd,
-            int[] outDegreeChunk
-    ) throws IOException {
-        boolean hasEdge = hasFirstEdge;
-        long edgeCount = 0;
-        BinaryEdgeWriter writer = null;
+    private SourceStorageStats sortDenseEdgesToSourceStorage(long vertexCount, int partitionCount) throws IOException {
+        logger.info("Sorting dense edges and streaming unique edges to source storage");
+        ensureSpaceForExternalSort(denseEdgesPath(), "dense edge sort");
+        SourceStorageSink sink = new SourceStorageSink(vertexCount, partitionCount);
         IOException failure = null;
-        Path path = edgesDir().resolve("src-part-%05d.bin".formatted(partition));
         try {
-            while (hasEdge && reader.denseFrom() < sourceEnd) {
-                int from = reader.denseFrom();
-                int to = reader.denseTo();
-                if (from < sourceStart) {
-                    throw new IOException("dense edge source partition order is corrupt: from=" + from);
-                }
-                if (writer == null) {
-                    writer = new BinaryEdgeWriter(path);
-                }
-                writer.write(from, to);
-                int localFrom = Math.toIntExact(from - sourceStart);
-                if (outDegreeChunk[localFrom] == Integer.MAX_VALUE) {
-                    throw new IOException("out-degree exceeds int32 for dense vertex " + from);
-                }
-                outDegreeChunk[localFrom]++;
-                edgeCount++;
-                hasEdge = reader.next();
-            }
+            new DenseEdgeExternalSorter(recordSortChunkSize()).sortUniqueToSink(
+                    denseEdgesPath(),
+                    config.workDir().resolve("sort").resolve("dense-edges"),
+                    "dense-edge-run",
+                    sink
+            );
+            sink.close();
+            Files.deleteIfExists(denseEdgesPath());
+            deleteRecursively(config.workDir().resolve("sort"));
+            return new SourceStorageStats(sink.edgeCount(), sink.sourcePartitions());
         } catch (IOException ex) {
             failure = ex;
             throw ex;
         } finally {
-            if (writer != null) {
+            if (failure != null) {
                 try {
-                    writer.close();
-                } catch (IOException ex) {
-                    if (failure != null) {
-                        failure.addSuppressed(ex);
-                    } else {
-                        throw ex;
-                    }
+                    sink.close();
+                } catch (IOException closeEx) {
+                    failure.addSuppressed(closeEx);
                 }
             }
         }
-        return new PartitionWriteResult(hasEdge, edgeCount);
     }
 
     private long writeDenseEdges() throws IOException {
@@ -450,7 +365,6 @@ public final class GraphPreprocessor {
         Files.deleteIfExists(endpointAssignmentsPath());
         Files.deleteIfExists(endpointAssignmentsSortedPath());
         Files.deleteIfExists(denseEdgesPath());
-        Files.deleteIfExists(denseEdgesSortedPath());
         deleteRecursively(config.workDir().resolve("sort"));
     }
 
@@ -511,10 +425,6 @@ public final class GraphPreprocessor {
         return config.workDir().resolve("dense_edges.bin");
     }
 
-    private Path denseEdgesSortedPath() {
-        return config.workDir().resolve("dense_edges.sorted.bin");
-    }
-
     private Path outDegreePath() {
         return config.workDir().resolve("vertex").resolve("out_degree.bin");
     }
@@ -544,21 +454,15 @@ public final class GraphPreprocessor {
     private record FirstPassStats(long edgeCount) {
     }
 
-    private record RewriteStats(long vertexCount, long reconstructedInputEdges, long storedEdges) {
+    private record RewriteStats(long vertexCount, long reconstructedInputEdges) {
     }
 
     private record SourceStorageStats(long edgeCount, List<SourcePartitionInfo> sourcePartitions) {
     }
 
-    private record PartitionWriteResult(boolean hasNextEdge, long edgeCount) {
-    }
-
     public record PreprocessingResult(
             long vertexCount,
             long edgeCount,
-            int sourcePartitionCount,
-            int destinationPartitionCount,
-            int chunkSize,
             Path outDegreePath,
             Path rankCurrentPath,
             Path rankNextPath,
@@ -572,6 +476,161 @@ public final class GraphPreprocessor {
             int partition,
             long bytes
     ) {
+    }
+
+    private final class SourceStorageSink implements DenseEdgeExternalSorter.EdgeSink, Closeable {
+        private final long vertexCount;
+        private final int partitionCount;
+        private final DiskIntArray outDegree;
+        private final int[] outDegreeChunk;
+        private final ByteBuffer scratch;
+        private final List<SourcePartitionInfo> sourcePartitions = new ArrayList<>();
+
+        private int currentPartition;
+        private long currentPartitionEdges;
+        private long totalEdges;
+        private BinaryEdgeWriter writer;
+        private boolean closed;
+
+        private SourceStorageSink(long vertexCount, int partitionCount) throws IOException {
+            this.vertexCount = vertexCount;
+            this.partitionCount = partitionCount;
+            this.outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize());
+            this.outDegreeChunk = new int[config.chunkSize()];
+            this.scratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
+            resetOutDegreeChunk();
+        }
+
+        @Override
+        public void accept(int from, int to) throws IOException {
+            ensureOpen();
+            if (from < 0 || from >= vertexCount || to < 0 || to >= vertexCount) {
+                throw new IOException("dense edge vertex id out of range: from=%d to=%d vertices=%d"
+                        .formatted(from, to, vertexCount));
+            }
+            int partition = from / config.chunkSize();
+            advanceToPartition(partition);
+            if (writer == null) {
+                writer = new BinaryEdgeWriter(edgesDir().resolve("src-part-%05d.bin".formatted(currentPartition)));
+            }
+            writer.write(from, to);
+            int localFrom = Math.toIntExact(from - sourceStart(currentPartition));
+            if (outDegreeChunk[localFrom] == Integer.MAX_VALUE) {
+                throw new IOException("out-degree exceeds int32 for dense vertex " + from);
+            }
+            outDegreeChunk[localFrom]++;
+            currentPartitionEdges++;
+            totalEdges++;
+            logProgress("dense-dedup-write", totalEdges);
+        }
+
+        private void advanceToPartition(int targetPartition) throws IOException {
+            if (targetPartition < currentPartition) {
+                throw new IOException("dense edge source order is corrupt: partition=%d current=%d"
+                        .formatted(targetPartition, currentPartition));
+            }
+            while (currentPartition < targetPartition) {
+                flushCurrentPartition();
+                currentPartition++;
+                resetOutDegreeChunk();
+            }
+        }
+
+        private void flushCurrentPartition() throws IOException {
+            IOException failure = null;
+            if (writer != null) {
+                try {
+                    writer.close();
+                } catch (IOException ex) {
+                    failure = ex;
+                } finally {
+                    writer = null;
+                }
+            }
+            if (currentPartitionEdges > 0) {
+                sourcePartitions.add(new SourcePartitionInfo(
+                        currentPartition,
+                        currentPartitionEdges * Integer.BYTES * 2L
+                ));
+            }
+            try {
+                outDegree.writeIntChunk(
+                        sourceStart(currentPartition),
+                        outDegreeChunk,
+                        sourceLength(currentPartition),
+                        scratch
+                );
+            } catch (IOException ex) {
+                if (failure != null) {
+                    failure.addSuppressed(ex);
+                    throw failure;
+                }
+                throw ex;
+            }
+            currentPartitionEdges = 0;
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        private void resetOutDegreeChunk() {
+            Arrays.fill(outDegreeChunk, 0, sourceLength(currentPartition), 0);
+        }
+
+        private long sourceStart(int partition) {
+            return (long) partition * config.chunkSize();
+        }
+
+        private int sourceLength(int partition) {
+            long start = sourceStart(partition);
+            return (int) Math.min(config.chunkSize(), vertexCount - start);
+        }
+
+        private void ensureOpen() throws IOException {
+            if (closed) {
+                throw new IOException("source storage sink is already closed");
+            }
+        }
+
+        private long edgeCount() {
+            return totalEdges;
+        }
+
+        private List<SourcePartitionInfo> sourcePartitions() {
+            return List.copyOf(sourcePartitions);
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed) {
+                return;
+            }
+            IOException failure = null;
+            try {
+                while (currentPartition < partitionCount) {
+                    flushCurrentPartition();
+                    currentPartition++;
+                    if (currentPartition < partitionCount) {
+                        resetOutDegreeChunk();
+                    }
+                }
+            } catch (IOException ex) {
+                failure = ex;
+            }
+            try {
+                outDegree.close();
+            } catch (IOException ex) {
+                if (failure != null) {
+                    failure.addSuppressed(ex);
+                } else {
+                    failure = ex;
+                }
+            }
+            closed = true;
+            if (failure != null) {
+                throw failure;
+            }
+        }
     }
 
     private static final class IntValueWriter implements Closeable {
