@@ -18,9 +18,13 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.List;
@@ -38,6 +42,7 @@ public final class GraphPreprocessor {
     private static final int MAX_INT_SORT_CHUNK = 500_000;
     private static final int MAX_RECORD_SORT_CHUNK = 250_000;
     private static final int MAX_TOTAL_SOURCE_PARTITION_WRITERS = 256;
+    private static final String WORKDIR_MARKER = ".largegraph-workdir";
 
     private final AppConfig config;
     private final ProgressLogger logger;
@@ -49,39 +54,41 @@ public final class GraphPreprocessor {
 
     public PreprocessingResult preprocess() throws IOException {
         validateInput();
-        prepareWorkDir();
-        checkFreeDiskSpace();
+        validatePathLayout();
+        checkInitialFreeDiskSpace();
 
         boolean success = false;
-        try {
+        try (WorkDirLock ignored = prepareWorkDir()) {
             FirstPassStats stats = runFirstPass();
+            checkPostFirstPassFreeDiskSpace(stats.edgeCount());
             ExternalIntSorter.SortUniqueResult vertices = sortVertices();
+            Files.deleteIfExists(vertexIdsUnsortedPath());
+
             long vertexCount = vertices.uniqueCount();
             int partitionCount = partitionCount(vertexCount);
 
             Path vertexDir = config.workDir().resolve("vertex");
             Files.createDirectories(vertexDir);
 
-            try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize());
-                 DiskDoubleArray rankCurrent = new DiskDoubleArray(rankCurrentPath(), vertexCount, config.chunkSize());
-                 DiskDoubleArray rankNext = new DiskDoubleArray(rankNextPath(), vertexCount, config.chunkSize())) {
-                outDegree.fill(0);
-                rankCurrent.fill(1.0 / vertexCount);
-                rankNext.fill(0.0);
+            RewriteStats rewriteStats = rewriteEdgesToDenseSourcePartitions(partitionCount);
+            if (rewriteStats.reconstructedInputEdges() != stats.edgeCount()) {
+                throw new IOException("dense rewrite lost input edges: expected=%d actual=%d"
+                        .formatted(stats.edgeCount(), rewriteStats.reconstructedInputEdges()));
             }
-
-            long edgeCount = rewriteEdgesToDenseSourcePartitions(partitionCount);
+            createOutDegreeFile(vertexCount);
             buildOutDegreeBySourcePartition(vertexCount, partitionCount);
+            validateOutDegreeSum(vertexCount, rewriteStats.storedEdges());
+            createAndInitializeRankFiles(vertexCount);
             writeSourcePartitionMetadata(partitionCount);
-            writeMetadata(vertexCount, edgeCount, partitionCount);
+            writeMetadata(vertexCount, rewriteStats.storedEdges(), partitionCount);
             cleanupPreprocessingIntermediates();
 
             logger.info("Preprocessing finished: vertices=%d inputEdges=%d storedEdges=%d sourcePartitions=%d"
-                    .formatted(vertexCount, stats.edgeCount(), edgeCount, partitionCount));
+                    .formatted(vertexCount, stats.edgeCount(), rewriteStats.storedEdges(), partitionCount));
             success = true;
             return new PreprocessingResult(
                     vertexCount,
-                    edgeCount,
+                    rewriteStats.storedEdges(),
                     partitionCount,
                     partitionCount,
                     config.chunkSize(),
@@ -139,7 +146,7 @@ public final class GraphPreprocessor {
         return result;
     }
 
-    private long rewriteEdgesToDenseSourcePartitions(int partitionCount) throws IOException {
+    private RewriteStats rewriteEdgesToDenseSourcePartitions(int partitionCount) throws IOException {
         logger.info("Sorting endpoint references by original id");
         new EndpointRefExternalSorter(recordSortChunkSize()).sort(
                 endpointRefsPath(),
@@ -147,9 +154,12 @@ public final class GraphPreprocessor {
                 config.workDir().resolve("sort").resolve("endpoint-refs"),
                 "endpoint-ref-run"
         );
+        Files.deleteIfExists(endpointRefsPath());
 
         logger.info("Joining endpoints with dense mapping");
         mergeJoinEndpointAssignments();
+        Files.deleteIfExists(mappingPath());
+        Files.deleteIfExists(endpointRefsSortedPath());
 
         logger.info("Sorting endpoint assignments by edge id");
         new EndpointAssignmentExternalSorter(recordSortChunkSize()).sort(
@@ -158,9 +168,11 @@ public final class GraphPreprocessor {
                 config.workDir().resolve("sort").resolve("endpoint-assignments"),
                 "endpoint-assignment-run"
         );
+        Files.deleteIfExists(endpointAssignmentsPath());
 
         logger.info("Writing dense edge stream");
-        writeDenseEdges();
+        long reconstructedInputEdges = writeDenseEdges();
+        Files.deleteIfExists(endpointAssignmentsSortedPath());
 
         logger.info("Sorting and deduplicating dense edges");
         new DenseEdgeExternalSorter(recordSortChunkSize()).sortUnique(
@@ -169,9 +181,12 @@ public final class GraphPreprocessor {
                 config.workDir().resolve("sort").resolve("dense-edges"),
                 "dense-edge-run"
         );
+        Files.deleteIfExists(denseEdgesPath());
 
         logger.info("Writing dense source partitions");
-        return writeDenseSourcePartitions(partitionCount);
+        long storedEdges = writeDenseSourcePartitions(partitionCount);
+        Files.deleteIfExists(denseEdgesSortedPath());
+        return new RewriteStats(reconstructedInputEdges, storedEdges);
     }
 
     private void mergeJoinEndpointAssignments() throws IOException {
@@ -197,7 +212,7 @@ public final class GraphPreprocessor {
         }
     }
 
-    private void writeDenseEdges() throws IOException {
+    private long writeDenseEdges() throws IOException {
         long edgeCount = 0;
 
         try (EndpointAssignmentReader reader = new EndpointAssignmentReader(endpointAssignmentsSortedPath());
@@ -220,6 +235,7 @@ public final class GraphPreprocessor {
                 logProgress("dense-rewrite", edgeCount);
             }
         }
+        return edgeCount;
     }
 
     private long writeDenseSourcePartitions(int partitionCount) throws IOException {
@@ -239,6 +255,39 @@ public final class GraphPreprocessor {
             }
         }
         return edgeCount;
+    }
+
+    private void createOutDegreeFile(long vertexCount) throws IOException {
+        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize())) {
+            outDegree.fill(0);
+        }
+    }
+
+    private void createAndInitializeRankFiles(long vertexCount) throws IOException {
+        try (DiskDoubleArray rankCurrent = new DiskDoubleArray(rankCurrentPath(), vertexCount, config.chunkSize());
+             DiskDoubleArray rankNext = new DiskDoubleArray(rankNextPath(), vertexCount, config.chunkSize())) {
+            rankCurrent.fill(1.0 / vertexCount);
+            rankNext.fill(0.0);
+        }
+    }
+
+    private void validateOutDegreeSum(long vertexCount, long expectedEdges) throws IOException {
+        long degreeSum = 0;
+        int[] chunk = new int[config.chunkSize()];
+        ByteBuffer scratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
+        try (DiskIntArray outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize(), false)) {
+            for (long start = 0; start < vertexCount; start += config.chunkSize()) {
+                int length = (int) Math.min(config.chunkSize(), vertexCount - start);
+                outDegree.readIntChunk(start, chunk, 0, length, scratch);
+                for (int i = 0; i < length; i++) {
+                    degreeSum += chunk[i];
+                }
+            }
+        }
+        if (degreeSum != expectedEdges) {
+            throw new IOException("out-degree sum mismatch: expected=%d actual=%d"
+                    .formatted(expectedEdges, degreeSum));
+        }
     }
 
     private void buildOutDegreeBySourcePartition(long vertexCount, int partitionCount) throws IOException {
@@ -335,14 +384,60 @@ public final class GraphPreprocessor {
         }
     }
 
-    private void checkFreeDiskSpace() throws IOException {
-        FileStore store = Files.getFileStore(config.workDir());
+    private void validatePathLayout() throws IOException {
+        Path input = config.input().toRealPath();
+        Path work = config.workDir().toAbsolutePath().normalize();
+        Path output = config.output().toAbsolutePath().normalize();
+        if (Files.exists(config.output())) {
+            output = config.output().toRealPath();
+        }
+        if (input.startsWith(work)) {
+            throw new IllegalArgumentException("input must not be located inside workdir");
+        }
+        if (output.startsWith(work)) {
+            throw new IllegalArgumentException("output must not be located inside workdir");
+        }
+        if (input.equals(output)) {
+            throw new IllegalArgumentException("input and output must be different files");
+        }
+    }
+
+    private void checkInitialFreeDiskSpace() throws IOException {
+        Path probe = Files.exists(config.workDir())
+                ? config.workDir()
+                : config.workDir().toAbsolutePath().normalize().getParent();
+        FileStore store = Files.getFileStore(probe);
         long free = store.getUsableSpace();
         long inputSize = Files.size(config.input());
-        long estimatedRequired = saturatingMultiply(inputSize, 8L);
+        requireFreeSpace(free, saturatingMultiply(inputSize, 48L), "initial preprocessing");
+    }
+
+    private void checkPostFirstPassFreeDiskSpace(long inputEdges) throws IOException {
+        FileStore store = Files.getFileStore(config.workDir());
+        long free = store.getUsableSpace();
+        long endpointSortBytes = saturatingMultiply(inputEdges, 26L * 2L);
+        long assignmentSortBytes = saturatingMultiply(inputEdges, 26L * 2L);
+        long denseSortBytes = saturatingMultiply(inputEdges, 16L);
+        long safetyReserve = 64L * 1024L * 1024L;
+        long required = saturatingAdd(
+                saturatingAdd(endpointSortBytes, assignmentSortBytes),
+                saturatingAdd(denseSortBytes, safetyReserve)
+        );
+        requireFreeSpace(free, required, "post first-pass preprocessing");
+    }
+
+    private void requireFreeSpace(long free, long estimatedRequired, String phase) {
         if (free < estimatedRequired) {
-            throw new IllegalStateException("not enough disk space: free=%d estimatedRequired=%d"
-                    .formatted(free, estimatedRequired));
+            throw new IllegalStateException("not enough disk space for %s: free=%d estimatedRequired=%d"
+                    .formatted(phase, free, estimatedRequired));
+        }
+    }
+
+    private long saturatingAdd(long left, long right) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException ex) {
+            return Long.MAX_VALUE;
         }
     }
 
@@ -362,26 +457,43 @@ public final class GraphPreprocessor {
         return Math.min(config.chunkSize(), MAX_INT_SORT_CHUNK);
     }
 
-    private void prepareWorkDir() throws IOException {
+    private WorkDirLock prepareWorkDir() throws IOException {
         try {
             Files.createDirectories(config.workDir());
-            Files.createDirectories(config.workDir().resolve("vertex"));
         } catch (IOException ex) {
             throw new IOException("cannot create workdir: " + config.workDir(), ex);
         }
-        deleteRecursively(edgesDir());
-        deleteRecursively(config.workDir().resolve("messages"));
-        deleteRecursively(config.workDir().resolve("sort"));
-        Files.deleteIfExists(vertexIdsUnsortedPath());
-        Files.deleteIfExists(verticesPath());
-        Files.deleteIfExists(mappingPath());
-        Files.deleteIfExists(endpointRefsPath());
-        Files.deleteIfExists(endpointRefsSortedPath());
-        Files.deleteIfExists(endpointAssignmentsPath());
-        Files.deleteIfExists(endpointAssignmentsSortedPath());
-        Files.deleteIfExists(denseEdgesPath());
-        Files.deleteIfExists(denseEdgesSortedPath());
-        Files.createDirectories(edgesDir());
+        Path marker = config.workDir().resolve(WORKDIR_MARKER);
+        try (var entries = Files.list(config.workDir())) {
+            if (entries.findAny().isPresent() && !Files.exists(marker)) {
+                throw new IOException("refusing to clean unmarked workdir: " + config.workDir());
+            }
+        }
+        Files.writeString(marker, "largegraph workdir\n", StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        WorkDirLock lock = WorkDirLock.acquire(config.workDir().resolve(".lock"));
+        boolean prepared = false;
+        try {
+            Files.createDirectories(config.workDir().resolve("vertex"));
+            deleteRecursively(edgesDir());
+            deleteRecursively(config.workDir().resolve("messages"));
+            deleteRecursively(config.workDir().resolve("sort"));
+            Files.deleteIfExists(vertexIdsUnsortedPath());
+            Files.deleteIfExists(verticesPath());
+            Files.deleteIfExists(mappingPath());
+            Files.deleteIfExists(endpointRefsPath());
+            Files.deleteIfExists(endpointRefsSortedPath());
+            Files.deleteIfExists(endpointAssignmentsPath());
+            Files.deleteIfExists(endpointAssignmentsSortedPath());
+            Files.deleteIfExists(denseEdgesPath());
+            Files.deleteIfExists(denseEdgesSortedPath());
+            Files.createDirectories(edgesDir());
+            prepared = true;
+            return lock;
+        } finally {
+            if (!prepared) {
+                lock.close();
+            }
+        }
     }
 
     private void cleanupPreprocessingIntermediates() throws IOException {
@@ -528,6 +640,9 @@ public final class GraphPreprocessor {
     private record FirstPassStats(long edgeCount) {
     }
 
+    private record RewriteStats(long reconstructedInputEdges, long storedEdges) {
+    }
+
     private record PartitionRange(int startPartition, int endPartitionExclusive) {
     }
 
@@ -581,6 +696,7 @@ public final class GraphPreprocessor {
         private final DataInputStream input;
 
         private MappingReader(Path path) throws IOException {
+            validateRecordAlignment(path, Integer.BYTES * 2);
             this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
         }
 
@@ -602,6 +718,7 @@ public final class GraphPreprocessor {
         private final DataInputStream input;
 
         private EndpointRefReader(Path path) throws IOException {
+            validateRecordAlignment(path, Integer.BYTES + Long.BYTES + Byte.BYTES);
             this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
         }
 
@@ -647,6 +764,7 @@ public final class GraphPreprocessor {
         private final DataInputStream input;
 
         private EndpointAssignmentReader(Path path) throws IOException {
+            validateRecordAlignment(path, Long.BYTES + Byte.BYTES + Integer.BYTES);
             this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
         }
 
@@ -692,6 +810,7 @@ public final class GraphPreprocessor {
         private final DataInputStream input;
 
         private DenseEdgeReader(Path path) throws IOException {
+            validateRecordAlignment(path, Integer.BYTES * 2);
             this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
         }
 
@@ -729,6 +848,54 @@ public final class GraphPreprocessor {
         @Override
         public void close() throws IOException {
             output.close();
+        }
+    }
+
+    private static void validateRecordAlignment(Path path, int recordBytes) throws IOException {
+        long size = Files.size(path);
+        if (size % recordBytes != 0) {
+            throw new IOException("corrupted file: %s, size=%d, recordBytes=%d"
+                    .formatted(path, size, recordBytes));
+        }
+    }
+
+    private static final class WorkDirLock implements Closeable {
+        private final FileChannel channel;
+        private final FileLock lock;
+
+        private WorkDirLock(FileChannel channel, FileLock lock) {
+            this.channel = channel;
+            this.lock = lock;
+        }
+
+        private static WorkDirLock acquire(Path path) throws IOException {
+            FileChannel channel = FileChannel.open(
+                    path,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE
+            );
+            FileLock lock;
+            try {
+                lock = channel.tryLock();
+            } catch (OverlappingFileLockException ex) {
+                channel.close();
+                throw new IOException("workdir is already locked by this process: " + path.getParent(), ex);
+            }
+            if (lock == null) {
+                channel.close();
+                throw new IOException("workdir is already locked by another process: " + path.getParent());
+            }
+            return new WorkDirLock(channel, lock);
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                lock.release();
+            } finally {
+                channel.close();
+            }
         }
     }
 }

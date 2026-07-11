@@ -50,7 +50,7 @@ final class DenseEdgeExternalSorter {
                 try (Writer writer = new Writer(run)) {
                     writeUniqueChunk(chunk, count, writer);
                 }
-                addRunBounded(runs, run, tempDir, runPrefix);
+                runs.add(run);
             }
         }
         return runs;
@@ -70,21 +70,6 @@ final class DenseEdgeExternalSorter {
                 haveLast = true;
             }
         }
-    }
-
-    private void addRunBounded(List<Path> runs, Path run, Path tempDir, String runPrefix) throws IOException {
-        runs.add(run);
-        if (runs.size() <= MAX_MERGE_FAN_IN) {
-            return;
-        }
-        List<Path> group = new ArrayList<>(runs.subList(0, MAX_MERGE_FAN_IN));
-        Path merged = tempDir.resolve("%s-incremental-merged-%05d.bin".formatted(runPrefix, System.nanoTime()));
-        mergeUnique(group, merged);
-        for (Path oldRun : group) {
-            Files.deleteIfExists(oldRun);
-        }
-        runs.subList(0, MAX_MERGE_FAN_IN).clear();
-        runs.add(merged);
     }
 
     private List<Path> compactRuns(List<Path> runs, Path tempDir, String runPrefix) throws IOException {
@@ -284,6 +269,7 @@ final class DenseEdgeExternalSorter {
         private final DataInputStream input;
 
         private Reader(Path path) throws IOException {
+            validateRecordAlignment(path, Integer.BYTES * 2);
             this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
         }
 
@@ -335,6 +321,14 @@ final class DenseEdgeExternalSorter {
         @Override
         public void close() throws IOException {
             output.close();
+        }
+    }
+
+    private static void validateRecordAlignment(Path path, int recordBytes) throws IOException {
+        long size = Files.size(path);
+        if (size % recordBytes != 0) {
+            throw new IOException("corrupted file: %s, size=%d, recordBytes=%d"
+                    .formatted(path, size, recordBytes));
         }
     }
 }

@@ -23,7 +23,6 @@ from,to
 - preprocessing без random disk increment на каждое исходное ребро;
 - message manifest вместо проверки всех `workers * partitions` файлов;
 - message buckets покрывают непрерывные диапазоны destination partitions;
-- heavy gather buckets могут делиться на непересекающиеся destination subranges;
 - балансировка scatter/gather через очередь задач с тяжелыми slices/buckets первыми;
 - потоковый output и `--top-k` через heap размера K.
 
@@ -33,7 +32,7 @@ from,to
 
 1. In-memory CSR / adjacency list. Самый быстрый вариант для умеренных графов, но отклонен: хранит adjacency и rank/outDegree массивы в RAM и плохо подходит под условие, где граф не помещается в heap.
 2. GraphChi-style sliding shards. Хороший external-memory вариант с сильной locality, но сложнее в реализации: нужно строить shards, аккуратно вести updates и поддерживать more involved scheduler.
-3. X-Stream-style scatter/gather + source partitions. Выбранный вариант: простой, streaming-friendly, устойчив к sparse ids и гипер-узлам, хорошо ложится на PageRank и держит heap bounded by chunk/cache sizes.
+3. X-Stream-style scatter/gather + source partitions. Выбранный вариант: простой, streaming-friendly, устойчив к sparse ids и гипер-узлам, хорошо ложится на PageRank и держит heap bounded by chunk sizes и числом активных tasks.
 
 ## PageRank
 
@@ -82,7 +81,8 @@ Preprocessing:
 9. Dense edges пишутся во временный stream.
 10. Dense edges сортируются по `(denseFrom, denseTo)` и deduplicate-ятся.
 11. Unique dense edges пишутся в `edges_by_source/src-part-xxxxx.bin`.
-12. После построения graph storage preprocessing intermediates удаляются.
+12. После каждого успешного этапа уже ненужные preprocessing intermediates удаляются.
+13. `out_degree.bin`, `rank_current.bin` и `rank_next.bin` создаются после построения graph storage.
 
 В heap не создается `HashMap<originalId, denseId>` для всех вершин.
 
@@ -145,8 +145,8 @@ out_degree.bin:             int outDegree[denseId]
 ```
 
 Во время preprocessing также временно создаются `vertex_ids_unsorted.bin`, `mapping.bin`,
-`endpoint_refs*.bin`, `endpoint_assignments*.bin`, `dense_edges*.bin` и `sort/`; после построения
-`edges_by_source`, `vertices.bin`, `out_degree.bin` и rank-файлов они удаляются.
+`endpoint_refs*.bin`, `endpoint_assignments*.bin`, `dense_edges*.bin` и `sort/`. Они удаляются
+поэтапно сразу после того, как следующий этап успешно создал свой output.
 
 ## Out-Degree
 
@@ -185,18 +185,17 @@ sourceLength = min(chunkSize, vertexCount - sourceStart)
 - каждый worker пишет `manifest.txt` со списком только реально созданных message buckets;
 - gather строит bucket index из manifest-файлов;
 - task создается для каждого непустого диапазона message bucket layout, включая buckets без messages, чтобы каждый destination chunk был перезаписан на итерации;
-- heavy bucket (`> 64 MiB`) делится на несколько destination subrange tasks; subrange tasks пишут непересекающиеся rank chunks;
 - buckets сортируются по суммарным message bytes по убыванию;
-- task открывает свой `DiskDoubleArray` для `rank_next.bin` и держит bounded LRU cache destination chunks;
+- task открывает свой `DiskDoubleArray` для `rank_next.bin` и держит один массив значений для диапазона bucket;
 - chunk впервые инициализируется base value внутри gather task, отдельного полного прохода заполнения `rank_next.bin` нет;
-- размер LRU cache задается через `--gather-chunk-cache-size`;
+- запись rank chunk идет через фиксированный небольшой IO buffer, а не через `ByteBuffer` размером со весь bucket;
 - `Files.exists` для всех `workers * partitions` не выполняется.
 
 Фаза 3, convergence:
 
 - `rank_current.bin` и `rank_next.bin` читаются chunk-ами;
 - chunks обрабатываются параллельно worker ranges, затем считается общий `l1Diff` и `rankSum`;
-- если `abs(rankSum - 1.0) > 1e-6`, пишется warning;
+- если `abs(rankSum - 1.0) > 1e-6` или обнаружен non-finite/negative rank, итерация завершается ошибкой;
 - rank files меняются местами через safer rename sequence с временным файлом и попыткой rollback;
 - messages удаляются после итерации, если `--keep-messages false`.
 
@@ -240,7 +239,7 @@ O(chunkSize * activeTasks)
 --chunk-size 10000..100000
 ```
 
-Для большего heap `chunk-size` можно увеличивать. Конфигурации, которые требуют impossible heap buffers или явно слишком большой gather cache относительно `Runtime.maxMemory()`, отклоняются на этапе parsing. Остальные рискованные комбинации получают conservative warning, но не останавливают запуск.
+Для большего heap `chunk-size` можно увеличивать. Конфигурации, которые требуют impossible heap buffers относительно `Runtime.maxMemory()`, отклоняются на этапе parsing. После preprocessing PageRank дополнительно планирует параллелизм по heap budget: если один task не помещается, запуск отклоняется; если все запрошенные threads не помещаются, runtime уменьшает параллелизм PageRank-фаз.
 
 External sort chunks имеют internal caps отдельно от PageRank `chunk-size`:
 
@@ -251,7 +250,7 @@ endpoint record sort chunk <= 250000 records
 
 Vertex id sort dedup-ит значения уже внутри sorted runs и во время intermediate merge. Dense edges сортируются primitive sorter-ом по `(denseFrom, denseTo)` и dedup-ятся во время merge.
 
-Runtime warning остается advisory и отдельно показывает `scatterEstimate`, `gatherCacheEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate`, `topKEstimate` и `maxHeap`; это не полноценный memory planner.
+Runtime warning до preprocessing остается advisory и отдельно показывает `scatterEstimate`, `intSortChunkEstimate`, `recordSortChunkEstimate`, `topKEstimate` и `maxHeap`; точный PageRank parallelism выбирается после того, как известны `vertexCount` и bucket layout.
 
 В heap не хранятся:
 
@@ -284,7 +283,7 @@ sort runs                  O(E + V)
 edges_by_source            O(E)
 ```
 
-Эти preprocessing temporary files удаляются после успешного preprocessing.
+Эти preprocessing temporary files не держатся до конца preprocessing, если следующий этап уже успешно завершился.
 
 Message IO остается `O(E)` на итерацию. Message buckets уменьшают file-count и metadata overhead, но не меняют асимптотику. Message record больше edge record:
 
@@ -376,7 +375,6 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
   --epsilon 1e-8 \
   --id-mode external-dense \
   --top-k 0 \
-  --gather-chunk-cache-size 8 \
   --scatter-slice-mb 16 \
   --keep-messages false
 ```
@@ -411,9 +409,9 @@ java -Xmx128m -jar build/libs/largegraph-pagerank-0.1.0.jar \
 
 - external sort implementation простой: chunk sort + k-way merge;
 - hot-path sort для endpoint refs/assignments/dense edges использует primitive arrays, generic record sorter оставлен как fallback;
-- sort run metadata bounded: при превышении merge fan-in runs инкрементально compact-ятся;
+- sort run metadata хранится как список `Path` для текущего уровня merge; runs сливаются сбалансированными pass-ами с fan-in 128;
 - preprocessing делает несколько disk passes;
-- preprocessing intermediate files удаляются после построения persistent graph storage;
+- preprocessing intermediate files удаляются поэтапно после успешного создания следующего файла;
 - messages занимают `O(E)` временного места на каждой итерации: на каждое ребро пишется record `int denseTo,double contribution` при наличии исходящей степени;
 - число unique observed vertices должно помещаться в `int denseId`;
 - `partitionCount = ceil(V / chunkSize)` должен помещаться в `int`;

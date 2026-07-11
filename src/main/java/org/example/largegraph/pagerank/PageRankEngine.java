@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -48,9 +49,11 @@ public final class PageRankEngine {
     }
 
     public PageRankRunResult run(PreprocessingResult graph) throws IOException {
+        int workerCount = plannedPageRankThreads(graph);
         List<SourcePartitionSlice> sourceSlices = readNonEmptySourcePartitionSlices(graph);
-        List<SourcePartitionWork> scatterWork = balancedSourcePartitionBuckets(sourceSlices);
-        ExecutorService executor = Executors.newFixedThreadPool(config.threads());
+        validateSourceSliceCoverage(sourceSlices, graph.edgeCount());
+        List<SourcePartitionWork> scatterWork = balancedSourcePartitionBuckets(sourceSlices, workerCount);
+        ExecutorService executor = Executors.newFixedThreadPool(workerCount);
         double lastDiff = Double.POSITIVE_INFINITY;
         double lastRankSum = Double.NaN;
         int completedIterations = 0;
@@ -60,20 +63,24 @@ public final class PageRankEngine {
                 long startedAt = System.nanoTime();
                 Path iterationMessagesDir = messagesDir(iteration);
                 deleteRecursively(iterationMessagesDir);
+                checkMessageDiskSpace(graph);
                 Files.createDirectories(iterationMessagesDir);
 
                 double danglingMass = calculateDanglingMass(graph, executor);
-                scatter(graph, iterationMessagesDir, executor, scatterWork);
                 double base = (1.0 - config.damping()) / graph.vertexCount()
                         + config.damping() * danglingMass / graph.vertexCount();
-                gather(graph, iterationMessagesDir, base, executor);
+                ScatterStats scatterStats = scatter(graph, iterationMessagesDir, executor, scatterWork, workerCount);
+                validateScatterStats(scatterStats, graph.edgeCount());
+                GatherStats gatherStats = gather(graph, iterationMessagesDir, base, executor);
+                if (gatherStats.messageCount() != scatterStats.messageCount()) {
+                    throw new IOException("gather message count mismatch: expected=%d actual=%d"
+                            .formatted(scatterStats.messageCount(), gatherStats.messageCount()));
+                }
 
                 ConvergenceStats stats = calculateConvergence(graph, executor);
                 lastDiff = stats.l1Diff();
                 lastRankSum = stats.rankSum();
-                if (Math.abs(lastRankSum - 1.0) > RANK_SUM_WARNING_THRESHOLD) {
-                    logger.info("WARNING rankSum drift: %.12g".formatted(lastRankSum));
-                }
+                validateConvergenceStats(stats);
 
                 swapRankFiles(graph.rankCurrentPath(), graph.rankNextPath());
                 if (!config.keepMessages()) {
@@ -108,6 +115,49 @@ public final class PageRankEngine {
             );
         } finally {
             shutdown(executor);
+        }
+    }
+
+    private int plannedPageRankThreads(PreprocessingResult graph) {
+        long maxHeap = MemoryUtils.maxHeapBytes();
+        long availableHeap = Math.max(1L, maxHeap * 65L / 100L);
+        long scatterTaskBytes = safeMultiply(graph.chunkSize(), 24L);
+        long convergenceTaskBytes = safeMultiply(graph.chunkSize(), 32L);
+        long gatherTaskBytes = safeAdd(safeMultiply(maxGatherBucketVertices(graph), 8L), 256L * 1024L);
+        long perTaskBytes = Math.max(scatterTaskBytes, Math.max(convergenceTaskBytes, gatherTaskBytes));
+        if (perTaskBytes > availableHeap) {
+            throw new IllegalArgumentException("memory configuration cannot fit one PageRank task: availableHeap=%s requiredPerTask=%s"
+                    .formatted(
+                            MemoryUtils.humanReadableBytes(availableHeap),
+                            MemoryUtils.humanReadableBytes(perTaskBytes)
+                    ));
+        }
+        int safeParallelism = Math.max(1, (int) Math.min(config.threads(), availableHeap / perTaskBytes));
+        if (safeParallelism < config.threads()) {
+            logger.info("Reducing PageRank parallelism from %d to %d for heap budget"
+                    .formatted(config.threads(), safeParallelism));
+        }
+        return safeParallelism;
+    }
+
+    private long maxGatherBucketVertices(PreprocessingResult graph) {
+        MessageBucketLayout layout = new MessageBucketLayout(
+                graph.destinationPartitionCount(),
+                graph.chunkSize(),
+                graph.vertexCount()
+        );
+        return layout.verticesPerBucket();
+    }
+
+    private void checkMessageDiskSpace(PreprocessingResult graph) throws IOException {
+        FileStore store = Files.getFileStore(config.workDir());
+        long free = store.getUsableSpace();
+        long messageBytes = safeMultiply(graph.edgeCount(), Integer.BYTES + Double.BYTES);
+        long reserveBytes = 64L * 1024L * 1024L;
+        long required = safeAdd(messageBytes, reserveBytes);
+        if (free < required) {
+            throw new IOException("not enough disk space for PageRank messages: free=%d estimatedRequired=%d"
+                    .formatted(free, required));
         }
     }
 
@@ -146,35 +196,40 @@ public final class PageRankEngine {
         return danglingMass;
     }
 
-    private void scatter(
+    private ScatterStats scatter(
             PreprocessingResult graph,
             Path iterationMessagesDir,
             ExecutorService executor,
-            List<SourcePartitionWork> workerBuckets
+            List<SourcePartitionWork> workerBuckets,
+            int workerCount
     ) throws IOException {
         List<Callable<ScatterStats>> tasks = new ArrayList<>(workerBuckets.size());
         for (SourcePartitionWork work : workerBuckets) {
-            tasks.add(() -> scatterSourcePartitions(graph, iterationMessagesDir, work));
+            tasks.add(() -> scatterSourcePartitions(graph, iterationMessagesDir, work, workerCount));
         }
         List<ScatterStats> stats = invokeAll(executor, tasks);
+        long edges = 0;
         long messages = 0;
         long bytes = 0;
         for (ScatterStats stat : stats) {
+            edges += stat.edgeCount();
             messages += stat.messageCount();
             bytes += stat.messageBytes();
         }
         logger.info("scatter messages=%d bytes=%d tasks=%d".formatted(messages, bytes, tasks.size()));
+        return new ScatterStats(edges, messages, bytes);
     }
 
     private ScatterStats scatterSourcePartitions(
             PreprocessingResult graph,
             Path iterationMessagesDir,
-            SourcePartitionWork work
+            SourcePartitionWork work,
+            int workerCount
     ) throws IOException {
         long edgeCount = 0;
         long messageCount = 0;
         Path workerDir = iterationMessagesDir.resolve("worker-%05d".formatted(work.workerId()));
-        int maxOpenMessageWriters = maxOpenMessageWritersPerWorker();
+        int maxOpenMessageWriters = maxOpenMessageWritersPerWorker(workerCount);
 
         try (DiskDoubleArray ranks = new DiskDoubleArray(graph.rankCurrentPath(), graph.vertexCount(), graph.chunkSize(), false);
              DiskIntArray outDegree = new DiskIntArray(graph.outDegreePath(), graph.vertexCount(), graph.chunkSize(), false);
@@ -226,9 +281,9 @@ public final class PageRankEngine {
         return new ScatterStats(edgeCount, messageCount, messageBytes);
     }
 
-    private int maxOpenMessageWritersPerWorker() {
-        int totalBudget = Math.max(config.threads(), Math.min(MAX_TOTAL_MESSAGE_WRITERS, config.threads() * 8));
-        return Math.max(1, totalBudget / config.threads());
+    private int maxOpenMessageWritersPerWorker(int workerCount) {
+        int totalBudget = Math.max(workerCount, Math.min(MAX_TOTAL_MESSAGE_WRITERS, workerCount * 8));
+        return Math.max(1, totalBudget / workerCount);
     }
 
     private Map<Integer, List<SourcePartitionSlice>> slicesBySourcePartition(List<SourcePartitionSlice> slices) {
@@ -279,7 +334,7 @@ public final class PageRankEngine {
         return new ScatterStats(edgeCount, messageCount, 0);
     }
 
-    private void gather(
+    private GatherStats gather(
             PreprocessingResult graph,
             Path iterationMessagesDir,
             double base,
@@ -304,6 +359,7 @@ public final class PageRankEngine {
             messages += stat.messageCount();
         }
         logger.info("gather messages=%d tasks=%d".formatted(messages, tasks.size()));
+        return new GatherStats(messages);
     }
 
     private void addGatherTasks(
@@ -347,6 +403,9 @@ public final class PageRankEngine {
                                     .formatted(bucket, to, rangeStart, rangeEndExclusive));
                         }
                         values[Math.toIntExact(to - rangeStart)] += reader.contribution();
+                        if (!Double.isFinite(values[Math.toIntExact(to - rangeStart)])) {
+                            throw new IOException("non-finite rank contribution while gathering bucket: " + bucket);
+                        }
                         messageCount++;
                     }
                 }
@@ -356,8 +415,8 @@ public final class PageRankEngine {
         return new GatherStats(messageCount);
     }
 
-    private List<SourcePartitionWork> balancedSourcePartitionBuckets(List<SourcePartitionSlice> sourceSlices) {
-        int workerCount = Math.max(1, Math.min(config.threads(), Math.max(1, sourceSlices.size())));
+    private List<SourcePartitionWork> balancedSourcePartitionBuckets(List<SourcePartitionSlice> sourceSlices, int maxWorkers) {
+        int workerCount = Math.max(1, Math.min(maxWorkers, Math.max(1, sourceSlices.size())));
         List<SourcePartitionWorkBuilder> buckets = new ArrayList<>(workerCount);
         for (int workerId = 0; workerId < workerCount; workerId++) {
             buckets.add(new SourcePartitionWorkBuilder(workerId));
@@ -461,7 +520,7 @@ public final class PageRankEngine {
             for (Path workerDir : paths.filter(Files::isDirectory).sorted().toList()) {
                 Path manifest = workerDir.resolve("manifest.txt");
                 if (!Files.exists(manifest)) {
-                    continue;
+                    throw new IOException("missing message manifest: " + manifest);
                 }
                 try (var reader = Files.newBufferedReader(manifest, StandardCharsets.UTF_8)) {
                     String line;
@@ -472,6 +531,9 @@ public final class PageRankEngine {
                         int bucket = Integer.parseInt(line.trim());
                         Path messagePath = workerDir.resolve("msg-bucket-%05d.bin".formatted(bucket));
                         long bytes = Files.size(messagePath);
+                        if (bytes % (Integer.BYTES + Double.BYTES) != 0) {
+                            throw new IOException("message file is not record-aligned: " + messagePath);
+                        }
                         index.computeIfAbsent(bucket, ignored -> new ArrayList<>())
                                 .add(new MessageFile(messagePath, bytes));
                     }
@@ -479,6 +541,29 @@ public final class PageRankEngine {
             }
         }
         return index;
+    }
+
+    private void validateSourceSliceCoverage(List<SourcePartitionSlice> sourceSlices, long expectedEdges) throws IOException {
+        long bytes = 0;
+        for (SourcePartitionSlice slice : sourceSlices) {
+            bytes += slice.bytes();
+        }
+        long edges = bytes / EDGE_RECORD_BYTES;
+        if (edges != expectedEdges) {
+            throw new IOException("source partition metadata edge count mismatch: expected=%d actual=%d"
+                    .formatted(expectedEdges, edges));
+        }
+    }
+
+    private void validateScatterStats(ScatterStats stats, long expectedEdges) throws IOException {
+        if (stats.edgeCount() != expectedEdges) {
+            throw new IOException("scatter edge count mismatch: expected=%d actual=%d"
+                    .formatted(expectedEdges, stats.edgeCount()));
+        }
+        if (stats.messageCount() != expectedEdges) {
+            throw new IOException("scatter message count mismatch: expected=%d actual=%d"
+                    .formatted(expectedEdges, stats.messageCount()));
+        }
     }
 
     private void validateMessageBuckets(
@@ -540,12 +625,26 @@ public final class PageRankEngine {
                 current.readChunk(start, currentChunk, 0, length, currentScratch);
                 next.readChunk(start, nextChunk, 0, length, nextScratch);
                 for (int i = 0; i < length; i++) {
+                    if (!Double.isFinite(nextChunk[i]) || nextChunk[i] < 0.0) {
+                        throw new IOException("invalid rank value at dense vertex %d: %.12g"
+                                .formatted(start + i, nextChunk[i]));
+                    }
                     l1Diff += Math.abs(nextChunk[i] - currentChunk[i]);
                     rankSum += nextChunk[i];
                 }
             }
         }
         return new ConvergenceStats(l1Diff, rankSum);
+    }
+
+    private void validateConvergenceStats(ConvergenceStats stats) throws IOException {
+        if (!Double.isFinite(stats.l1Diff()) || !Double.isFinite(stats.rankSum())) {
+            throw new IOException("non-finite convergence stats: diff=%s rankSum=%s"
+                    .formatted(stats.l1Diff(), stats.rankSum()));
+        }
+        if (Math.abs(stats.rankSum() - 1.0) > RANK_SUM_WARNING_THRESHOLD) {
+            throw new IOException("rankSum invariant failed: %.12g".formatted(stats.rankSum()));
+        }
     }
 
     private List<ChunkRange> chunkRanges(PreprocessingResult graph) {
@@ -695,6 +794,22 @@ public final class PageRankEngine {
 
     private void deleteRecursively(Path path) throws IOException {
         FileUtils.deleteRecursively(path);
+    }
+
+    private long safeMultiply(long left, long right) {
+        try {
+            return Math.multiplyExact(left, right);
+        } catch (ArithmeticException ex) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    private long safeAdd(long left, long right) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException ex) {
+            return Long.MAX_VALUE;
+        }
     }
 
     public record PageRankRunResult(

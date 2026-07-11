@@ -10,6 +10,7 @@ import java.nio.file.StandardOpenOption;
 
 public final class DiskDoubleArray implements Closeable {
     private static final int BYTES = Double.BYTES;
+    private static final int DEFAULT_WRITE_BUFFER_BYTES = 128 * 1024;
 
     private final Path path;
     private final long length;
@@ -82,8 +83,23 @@ public final class DiskDoubleArray implements Closeable {
         if (values.length < requestedLength) {
             throw new IllegalArgumentException("values array is shorter than requested length");
         }
-        ByteBuffer buffer = ByteBuffer.allocate(requestedLength * BYTES);
-        writeChunk(startId, values, requestedLength, buffer);
+        int bufferBytes = requestedLength == 0
+                ? BYTES
+                : (int) Math.min(DEFAULT_WRITE_BUFFER_BYTES, Math.max((long) BYTES, (long) requestedLength * BYTES));
+        ByteBuffer buffer = ByteBuffer.allocate(bufferBytes);
+        long position = startId * BYTES;
+        int offset = 0;
+        while (offset < requestedLength) {
+            buffer.clear();
+            int doubles = Math.min(requestedLength - offset, buffer.capacity() / BYTES);
+            for (int i = 0; i < doubles; i++) {
+                buffer.putDouble(values[offset + i]);
+            }
+            buffer.flip();
+            writeFully(buffer, position);
+            position += (long) doubles * BYTES;
+            offset += doubles;
+        }
     }
 
     public void writeChunk(long startId, double[] values, int requestedLength, ByteBuffer scratch) throws IOException {
