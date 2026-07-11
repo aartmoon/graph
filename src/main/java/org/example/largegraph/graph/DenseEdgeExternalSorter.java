@@ -12,13 +12,13 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.PriorityQueue;
 
 final class DenseEdgeExternalSorter {
     private static final int MAX_MERGE_FAN_IN = 128;
-    private static final int INSERTION_SORT_THRESHOLD = 24;
 
     private final int maxRecordsPerRun;
 
@@ -50,9 +50,9 @@ final class DenseEdgeExternalSorter {
     private List<Path> createSortedUniqueRuns(Path input, Path tempDir, String runPrefix) throws IOException {
         List<Path> runs = new ArrayList<>();
         try (Reader reader = new Reader(input)) {
+            Chunk chunk = new Chunk(maxRecordsPerRun);
             int runId = 0;
             while (true) {
-                Chunk chunk = new Chunk(maxRecordsPerRun);
                 int count = reader.readChunk(chunk);
                 if (count == 0) {
                     break;
@@ -70,15 +70,12 @@ final class DenseEdgeExternalSorter {
 
     private void writeUniqueChunk(Chunk chunk, int count, Writer writer) throws IOException {
         boolean haveLast = false;
-        int lastFrom = 0;
-        int lastTo = 0;
+        long last = 0;
         for (int i = 0; i < count; i++) {
-            int from = chunk.froms[i];
-            int to = chunk.tos[i];
-            if (!haveLast || from != lastFrom || to != lastTo) {
-                writer.write(from, to);
-                lastFrom = from;
-                lastTo = to;
+            long edge = chunk.edges[i];
+            if (!haveLast || edge != last) {
+                writer.write((int) (edge >>> 32), (int) edge);
+                last = edge;
                 haveLast = true;
             }
         }
@@ -194,78 +191,7 @@ final class DenseEdgeExternalSorter {
     }
 
     private void sortChunk(Chunk chunk, int count) {
-        quickSort(chunk, 0, count - 1);
-        insertionSort(chunk, 0, count - 1);
-    }
-
-    private void quickSort(Chunk chunk, int low, int high) {
-        while (high - low > INSERTION_SORT_THRESHOLD) {
-            int pivotIndex = low + ((high - low) >>> 1);
-            int pivotFrom = chunk.froms[pivotIndex];
-            int pivotTo = chunk.tos[pivotIndex];
-            int i = low;
-            int j = high;
-            while (i <= j) {
-                while (compare(chunk, i, pivotFrom, pivotTo) < 0) {
-                    i++;
-                }
-                while (compare(chunk, j, pivotFrom, pivotTo) > 0) {
-                    j--;
-                }
-                if (i <= j) {
-                    swap(chunk, i, j);
-                    i++;
-                    j--;
-                }
-            }
-            if (j - low < high - i) {
-                if (low < j) {
-                    quickSort(chunk, low, j);
-                }
-                low = i;
-            } else {
-                if (i < high) {
-                    quickSort(chunk, i, high);
-                }
-                high = j;
-            }
-        }
-    }
-
-    private void insertionSort(Chunk chunk, int low, int high) {
-        for (int i = low + 1; i <= high; i++) {
-            int from = chunk.froms[i];
-            int to = chunk.tos[i];
-            int j = i - 1;
-            while (j >= low && compare(chunk, j, from, to) > 0) {
-                chunk.froms[j + 1] = chunk.froms[j];
-                chunk.tos[j + 1] = chunk.tos[j];
-                j--;
-            }
-            chunk.froms[j + 1] = from;
-            chunk.tos[j + 1] = to;
-        }
-    }
-
-    private int compare(Chunk chunk, int index, int from, int to) {
-        int compared = Integer.compare(chunk.froms[index], from);
-        if (compared != 0) {
-            return compared;
-        }
-        return Integer.compare(chunk.tos[index], to);
-    }
-
-    private void swap(Chunk chunk, int left, int right) {
-        if (left == right) {
-            return;
-        }
-        int from = chunk.froms[left];
-        chunk.froms[left] = chunk.froms[right];
-        chunk.froms[right] = from;
-
-        int to = chunk.tos[left];
-        chunk.tos[left] = chunk.tos[right];
-        chunk.tos[right] = to;
+        Arrays.sort(chunk.edges, 0, count);
     }
 
     private void closeReaders(List<Reader> readers, IOException failure) throws IOException {
@@ -287,12 +213,10 @@ final class DenseEdgeExternalSorter {
     }
 
     private static final class Chunk {
-        private final int[] froms;
-        private final int[] tos;
+        private final long[] edges;
 
         private Chunk(int capacity) {
-            this.froms = new int[capacity];
-            this.tos = new int[capacity];
+            this.edges = new long[capacity];
         }
     }
 
@@ -328,10 +252,14 @@ final class DenseEdgeExternalSorter {
 
         private int readChunk(Chunk chunk) throws IOException {
             int count = 0;
-            while (count < chunk.froms.length) {
+            while (count < chunk.edges.length) {
                 try {
-                    chunk.froms[count] = input.readInt();
-                    chunk.tos[count] = input.readInt();
+                    int from = input.readInt();
+                    int to = input.readInt();
+                    if (from < 0 || to < 0) {
+                        throw new IOException("negative dense vertex id in " + input);
+                    }
+                    chunk.edges[count] = ((long) from << 32) | (to & 0xffff_ffffL);
                     count++;
                 } catch (EOFException ex) {
                     break;

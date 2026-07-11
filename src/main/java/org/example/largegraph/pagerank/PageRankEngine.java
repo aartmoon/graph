@@ -374,8 +374,7 @@ public final class PageRankEngine {
                 int degree = outDegreeChunk[localFrom];
                 if (degree > 0) {
                     double contribution = config.damping() * rankChunk[localFrom] / degree;
-                    int destinationPartition = to / config.chunkSize();
-                    messageWriters.write(destinationPartition, to, contribution);
+                    messageWriters.write(to, contribution);
                     messageCount++;
                 }
                 edgeCount++;

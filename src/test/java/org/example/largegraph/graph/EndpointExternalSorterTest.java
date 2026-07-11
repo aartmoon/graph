@@ -34,7 +34,7 @@ final class EndpointExternalSorterTest {
         records.add(new EndpointRefRecord(3, 6L, (byte) 1));
         writeEndpointRefs(input, records);
 
-        new EndpointRefExternalSorter(1).sort(
+        new EndpointExternalSorter(1, EndpointExternalSorter.Order.BY_ORIGINAL_VERTEX).sort(
                 input,
                 output,
                 tempDir.resolve("sort").resolve("endpoint-refs"),
@@ -63,7 +63,7 @@ final class EndpointExternalSorterTest {
         records.add(new EndpointAssignmentRecord(4L, (byte) 1, 30));
         writeEndpointAssignments(input, records);
 
-        new EndpointAssignmentExternalSorter(1).sort(
+        new EndpointExternalSorter(1, EndpointExternalSorter.Order.BY_EDGE_AND_SIDE).sort(
                 input,
                 output,
                 tempDir.resolve("sort").resolve("endpoint-assignments"),

@@ -12,18 +12,22 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.PriorityQueue;
 
-final class EndpointAssignmentExternalSorter {
+final class EndpointExternalSorter {
     private static final int MAX_MERGE_FAN_IN = 128;
     private static final int INSERTION_SORT_THRESHOLD = 24;
 
     private final int maxRecordsPerRun;
 
-    EndpointAssignmentExternalSorter(int maxRecordsPerRun) {
+    enum Order { BY_ORIGINAL_VERTEX, BY_EDGE_AND_SIDE }
+
+    private final Order order;
+
+    EndpointExternalSorter(int maxRecordsPerRun, Order order) {
         this.maxRecordsPerRun = Math.max(1, maxRecordsPerRun);
+        this.order = order;
     }
 
     void sort(Path input, Path output, Path tempDir, String runPrefix) throws IOException {
@@ -38,9 +42,9 @@ final class EndpointAssignmentExternalSorter {
     private List<Path> createSortedRuns(Path input, Path tempDir, String runPrefix) throws IOException {
         List<Path> runs = new ArrayList<>();
         try (Reader reader = new Reader(input)) {
+            Chunk chunk = new Chunk(maxRecordsPerRun);
             int runId = 0;
             while (true) {
-                Chunk chunk = new Chunk(maxRecordsPerRun);
                 int count = reader.readChunk(chunk);
                 if (count == 0) {
                     break;
@@ -49,7 +53,7 @@ final class EndpointAssignmentExternalSorter {
                 Path run = tempDir.resolve("%s-%05d.bin".formatted(runPrefix, runId++));
                 try (Writer writer = new Writer(run)) {
                     for (int i = 0; i < count; i++) {
-                        writer.write(chunk.edgeIds[i], chunk.sides[i], chunk.denseIds[i]);
+                        writer.write(chunk.vertexIds[i], chunk.edgeIds[i], chunk.sides[i]);
                     }
                 }
                 runs.add(run);
@@ -86,11 +90,11 @@ final class EndpointAssignmentExternalSorter {
             Files.createDirectories(output.getParent());
         }
 
-        PriorityQueue<Cursor> queue = new PriorityQueue<>(Comparator
-                .comparingLong(Cursor::edgeId)
-                .thenComparingInt(Cursor::side)
-                .thenComparingInt(Cursor::denseId)
-                .thenComparingInt(Cursor::runId));
+        PriorityQueue<Cursor> queue = new PriorityQueue<>((left, right) -> {
+            int compared = compare(left.vertexId, left.edgeId, left.side,
+                    right.vertexId, right.edgeId, right.side);
+            return compared != 0 ? compared : Integer.compare(left.runId, right.runId);
+        });
         List<Reader> readers = new ArrayList<>(runs.size());
         IOException failure = null;
 
@@ -106,7 +110,7 @@ final class EndpointAssignmentExternalSorter {
 
             while (!queue.isEmpty()) {
                 Cursor cursor = queue.poll();
-                writer.write(cursor.edgeId(), cursor.side(), cursor.denseId());
+                writer.write(cursor.vertexId, cursor.edgeId, cursor.side);
                 if (readers.get(cursor.runId()).read(cursor)) {
                     queue.add(cursor);
                 }
@@ -127,16 +131,16 @@ final class EndpointAssignmentExternalSorter {
     private void quickSort(Chunk chunk, int low, int high) {
         while (high - low > INSERTION_SORT_THRESHOLD) {
             int pivotIndex = low + ((high - low) >>> 1);
+            int pivotOriginalId = chunk.vertexIds[pivotIndex];
             long pivotEdgeId = chunk.edgeIds[pivotIndex];
             byte pivotSide = chunk.sides[pivotIndex];
-            int pivotDenseId = chunk.denseIds[pivotIndex];
             int i = low;
             int j = high;
             while (i <= j) {
-                while (compare(chunk, i, pivotEdgeId, pivotSide, pivotDenseId) < 0) {
+                while (compare(chunk, i, pivotOriginalId, pivotEdgeId, pivotSide) < 0) {
                     i++;
                 }
-                while (compare(chunk, j, pivotEdgeId, pivotSide, pivotDenseId) > 0) {
+                while (compare(chunk, j, pivotOriginalId, pivotEdgeId, pivotSide) > 0) {
                     j--;
                 }
                 if (i <= j) {
@@ -161,38 +165,49 @@ final class EndpointAssignmentExternalSorter {
 
     private void insertionSort(Chunk chunk, int low, int high) {
         for (int i = low + 1; i <= high; i++) {
+            int originalId = chunk.vertexIds[i];
             long edgeId = chunk.edgeIds[i];
             byte side = chunk.sides[i];
-            int denseId = chunk.denseIds[i];
             int j = i - 1;
-            while (j >= low && compare(chunk, j, edgeId, side, denseId) > 0) {
+            while (j >= low && compare(chunk, j, originalId, edgeId, side) > 0) {
+                chunk.vertexIds[j + 1] = chunk.vertexIds[j];
                 chunk.edgeIds[j + 1] = chunk.edgeIds[j];
                 chunk.sides[j + 1] = chunk.sides[j];
-                chunk.denseIds[j + 1] = chunk.denseIds[j];
                 j--;
             }
+            chunk.vertexIds[j + 1] = originalId;
             chunk.edgeIds[j + 1] = edgeId;
             chunk.sides[j + 1] = side;
-            chunk.denseIds[j + 1] = denseId;
         }
     }
 
-    private int compare(Chunk chunk, int index, long edgeId, byte side, int denseId) {
-        int compared = Long.compare(chunk.edgeIds[index], edgeId);
-        if (compared != 0) {
-            return compared;
+    private int compare(Chunk chunk, int index, int originalId, long edgeId, byte side) {
+        return compare(chunk.vertexIds[index], chunk.edgeIds[index], chunk.sides[index], originalId, edgeId, side);
+    }
+
+    private int compare(int leftVertex, long leftEdge, byte leftSide,
+                        int rightVertex, long rightEdge, byte rightSide) {
+        int compared;
+        if (order == Order.BY_ORIGINAL_VERTEX) {
+            compared = Integer.compare(leftVertex, rightVertex);
+            if (compared == 0) compared = Long.compare(leftEdge, rightEdge);
+            if (compared == 0) compared = Byte.compare(leftSide, rightSide);
+        } else {
+            compared = Long.compare(leftEdge, rightEdge);
+            if (compared == 0) compared = Byte.compare(leftSide, rightSide);
+            if (compared == 0) compared = Integer.compare(leftVertex, rightVertex);
         }
-        compared = Byte.compare(chunk.sides[index], side);
-        if (compared != 0) {
-            return compared;
-        }
-        return Integer.compare(chunk.denseIds[index], denseId);
+        return compared;
     }
 
     private void swap(Chunk chunk, int left, int right) {
         if (left == right) {
             return;
         }
+        int originalId = chunk.vertexIds[left];
+        chunk.vertexIds[left] = chunk.vertexIds[right];
+        chunk.vertexIds[right] = originalId;
+
         long edgeId = chunk.edgeIds[left];
         chunk.edgeIds[left] = chunk.edgeIds[right];
         chunk.edgeIds[right] = edgeId;
@@ -200,10 +215,6 @@ final class EndpointAssignmentExternalSorter {
         byte side = chunk.sides[left];
         chunk.sides[left] = chunk.sides[right];
         chunk.sides[right] = side;
-
-        int denseId = chunk.denseIds[left];
-        chunk.denseIds[left] = chunk.denseIds[right];
-        chunk.denseIds[right] = denseId;
     }
 
     private void closeReaders(List<Reader> readers, IOException failure) throws IOException {
@@ -225,22 +236,22 @@ final class EndpointAssignmentExternalSorter {
     }
 
     private static final class Chunk {
+        private final int[] vertexIds;
         private final long[] edgeIds;
         private final byte[] sides;
-        private final int[] denseIds;
 
         private Chunk(int capacity) {
+            this.vertexIds = new int[capacity];
             this.edgeIds = new long[capacity];
             this.sides = new byte[capacity];
-            this.denseIds = new int[capacity];
         }
     }
 
     private static final class Cursor {
         private final int runId;
+        private int vertexId;
         private long edgeId;
         private byte side;
-        private int denseId;
 
         private Cursor(int runId) {
             this.runId = runId;
@@ -250,34 +261,21 @@ final class EndpointAssignmentExternalSorter {
             return runId;
         }
 
-        private long edgeId() {
-            return edgeId;
-        }
-
-        private int side() {
-            return side;
-        }
-
-        private int denseId() {
-            return denseId;
-        }
     }
 
-    private static final class Reader implements Closeable {
+    private final class Reader implements Closeable {
         private final DataInputStream input;
 
         private Reader(Path path) throws IOException {
-            validateRecordAlignment(path, Long.BYTES + Byte.BYTES + Integer.BYTES);
+            validateRecordAlignment(path, Integer.BYTES + Long.BYTES + Byte.BYTES);
             this.input = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
         }
 
         private int readChunk(Chunk chunk) throws IOException {
             int count = 0;
-            while (count < chunk.edgeIds.length) {
+            while (count < chunk.vertexIds.length) {
                 try {
-                    chunk.edgeIds[count] = input.readLong();
-                    chunk.sides[count] = input.readByte();
-                    chunk.denseIds[count] = input.readInt();
+                    read(chunk, count);
                     count++;
                 } catch (EOFException ex) {
                     break;
@@ -288,12 +286,30 @@ final class EndpointAssignmentExternalSorter {
 
         private boolean read(Cursor cursor) throws IOException {
             try {
-                cursor.edgeId = input.readLong();
-                cursor.side = input.readByte();
-                cursor.denseId = input.readInt();
+                if (order == Order.BY_ORIGINAL_VERTEX) {
+                    cursor.vertexId = input.readInt();
+                    cursor.edgeId = input.readLong();
+                    cursor.side = input.readByte();
+                } else {
+                    cursor.edgeId = input.readLong();
+                    cursor.side = input.readByte();
+                    cursor.vertexId = input.readInt();
+                }
                 return true;
             } catch (EOFException ex) {
                 return false;
+            }
+        }
+
+        private void read(Chunk chunk, int index) throws IOException {
+            if (order == Order.BY_ORIGINAL_VERTEX) {
+                chunk.vertexIds[index] = input.readInt();
+                chunk.edgeIds[index] = input.readLong();
+                chunk.sides[index] = input.readByte();
+            } else {
+                chunk.edgeIds[index] = input.readLong();
+                chunk.sides[index] = input.readByte();
+                chunk.vertexIds[index] = input.readInt();
             }
         }
 
@@ -303,7 +319,7 @@ final class EndpointAssignmentExternalSorter {
         }
     }
 
-    private static final class Writer implements Closeable {
+    private final class Writer implements Closeable {
         private final DataOutputStream output;
 
         private Writer(Path path) throws IOException {
@@ -313,10 +329,16 @@ final class EndpointAssignmentExternalSorter {
             this.output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)));
         }
 
-        private void write(long edgeId, int side, int denseId) throws IOException {
-            output.writeLong(edgeId);
-            output.writeByte(side);
-            output.writeInt(denseId);
+        private void write(int vertexId, long edgeId, byte side) throws IOException {
+            if (order == Order.BY_ORIGINAL_VERTEX) {
+                output.writeInt(vertexId);
+                output.writeLong(edgeId);
+                output.writeByte(side);
+            } else {
+                output.writeLong(edgeId);
+                output.writeByte(side);
+                output.writeInt(vertexId);
+            }
         }
 
         @Override

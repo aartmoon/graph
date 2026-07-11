@@ -33,8 +33,8 @@ public final class MessagePartitionWriterManager implements Closeable {
         Files.createDirectories(workerDir);
     }
 
-    public void write(int destinationPartition, int to, double contribution) throws IOException {
-        int bucket = bucketLayout.bucketFor(destinationPartition, to);
+    public void write(int to, double contribution) throws IOException {
+        int bucket = bucketLayout.bucketFor(to);
         touchedBuckets.add(bucket);
         writerFor(bucket).write(to, contribution);
     }

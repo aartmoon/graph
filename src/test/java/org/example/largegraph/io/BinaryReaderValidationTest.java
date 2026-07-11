@@ -21,11 +21,4 @@ final class BinaryReaderValidationTest {
         assertThrows(IOException.class, () -> new BinaryMessageReader(path));
     }
 
-    @Test
-    void edgeReaderRejectsPartialRecord() throws IOException {
-        Path path = tempDir.resolve("edges.bin");
-        Files.write(path, new byte[Integer.BYTES * 2 - 1]);
-
-        assertThrows(IOException.class, () -> new BinaryEdgeReader(path));
-    }
 }

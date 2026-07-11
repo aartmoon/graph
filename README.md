@@ -70,11 +70,11 @@ Preprocessing:
 
 1. CSV читается потоково.
 2. Пишется `endpoint_refs.bin`: `originalId, edgeId, side`.
-3. Endpoint references сортируются по `originalId`.
+3. Общий специализированный `EndpointExternalSorter` сортирует references по `originalId`.
 4. Один последовательный проход назначает dense ids, пишет `vertices.bin` и `endpoint_assignments.bin`.
-5. Endpoint assignments сортируются по `(edgeId, side)`.
+5. Тот же sorter с явным вторым порядком сортирует assignments по `(edgeId, side)`.
 6. Dense edges пишутся во временный stream.
-7. Dense edges сортируются по `(denseFrom, denseTo)` и deduplicate-ятся.
+7. Dense edges упаковываются в primitive `long[]`, сортируются по `(denseFrom, denseTo)` и deduplicate-ятся.
 8. Unique dense edges одним проходом пишутся в `edges_by_source/src-part-xxxxx.bin` и `out_degree.bin`.
 9. После каждого успешного этапа уже ненужные preprocessing intermediates удаляются.
 10. `rank_current.bin` создаётся после построения graph storage; `rank_next.bin` полностью создаёт gather на первой итерации.

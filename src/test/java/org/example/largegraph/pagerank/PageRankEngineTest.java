@@ -138,9 +138,9 @@ final class PageRankEngineTest {
         Path workerDir = tempDir.resolve("messages").resolve("worker-00000");
         List<MessageFileInfo> files;
         MessagePartitionWriterManager writers = new MessagePartitionWriterManager(workerDir, 4, 2, 8, 2);
-        writers.write(2, 5, 0.25);
-        writers.write(0, 1, 0.75);
-        writers.write(3, 6, 0.5);
+        writers.write(5, 0.25);
+        writers.write(1, 0.75);
+        writers.write(6, 0.5);
         writers.close();
         files = writers.messageFiles();
 

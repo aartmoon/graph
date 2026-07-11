@@ -103,7 +103,7 @@ public final class GraphPreprocessor {
     private RewriteStats rewriteEdgesToDenseSourcePartitions() throws IOException {
         logger.info("Sorting endpoint references by original id");
         ensureSpaceForExternalSort(endpointRefsPath(), "endpoint reference sort");
-        new EndpointRefExternalSorter(recordSortChunkSize()).sort(
+        new EndpointExternalSorter(recordSortChunkSize(), EndpointExternalSorter.Order.BY_ORIGINAL_VERTEX).sort(
                 endpointRefsPath(),
                 endpointRefsSortedPath(),
                 config.workDir().resolve("sort").resolve("endpoint-refs"),
@@ -117,7 +117,7 @@ public final class GraphPreprocessor {
 
         logger.info("Sorting endpoint assignments by edge id");
         ensureSpaceForExternalSort(endpointAssignmentsPath(), "endpoint assignment sort");
-        new EndpointAssignmentExternalSorter(recordSortChunkSize()).sort(
+        new EndpointExternalSorter(recordSortChunkSize(), EndpointExternalSorter.Order.BY_EDGE_AND_SIDE).sort(
                 endpointAssignmentsPath(),
                 endpointAssignmentsSortedPath(),
                 config.workDir().resolve("sort").resolve("endpoint-assignments"),
