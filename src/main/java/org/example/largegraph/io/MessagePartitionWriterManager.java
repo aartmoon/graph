@@ -59,11 +59,8 @@ public final class MessagePartitionWriterManager implements Closeable {
             return;
         }
         Iterator<Map.Entry<Integer, BinaryMessageWriter>> iterator = writers.entrySet().iterator();
-        if (iterator.hasNext()) {
-            Map.Entry<Integer, BinaryMessageWriter> eldest = iterator.next();
-            eldest.getValue().close();
-            iterator.remove();
-        }
+        iterator.next().getValue().close();
+        iterator.remove();
     }
 
     @Override

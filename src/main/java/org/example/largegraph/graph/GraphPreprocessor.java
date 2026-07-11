@@ -7,7 +7,9 @@ import org.example.largegraph.storage.DiskDoubleArray;
 import org.example.largegraph.storage.DiskIntArray;
 import org.example.largegraph.util.FileUtils;
 import org.example.largegraph.util.MemoryUtils;
+import org.example.largegraph.util.PathLayoutValidator;
 import org.example.largegraph.util.ProgressLogger;
+import org.example.largegraph.util.SaturatedMath;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -38,18 +40,17 @@ public final class GraphPreprocessor {
     }
 
     public PreprocessingResult preprocess() throws IOException {
-        validateInput();
-        validatePathLayout();
+        PathLayoutValidator.validate(config);
         checkInitialFreeDiskSpace();
 
         boolean success = false;
         try {
-            FirstPassStats stats = runFirstPass();
-            checkPostFirstPassFreeDiskSpace(stats.edgeCount());
+            long inputEdges = runFirstPass();
+            checkPostFirstPassFreeDiskSpace(inputEdges);
             RewriteStats rewriteStats = rewriteEdgesToDenseSourcePartitions();
-            if (rewriteStats.reconstructedInputEdges() != stats.edgeCount()) {
+            if (rewriteStats.reconstructedInputEdges() != inputEdges) {
                 throw new IOException("dense rewrite lost input edges: expected=%d actual=%d"
-                        .formatted(stats.edgeCount(), rewriteStats.reconstructedInputEdges()));
+                        .formatted(inputEdges, rewriteStats.reconstructedInputEdges()));
             }
             long vertexCount = rewriteStats.vertexCount();
             int partitionCount = partitionCount(vertexCount);
@@ -59,7 +60,7 @@ public final class GraphPreprocessor {
             createAndInitializeRankFiles(vertexCount);
 
             logger.info("Preprocessing finished: vertices=%d inputEdges=%d storedEdges=%d sourcePartitions=%d"
-                    .formatted(vertexCount, stats.edgeCount(), sourceStorage.edgeCount(), partitionCount));
+                    .formatted(vertexCount, inputEdges, sourceStorage.edgeCount(), partitionCount));
             success = true;
             return new PreprocessingResult(
                     vertexCount,
@@ -78,7 +79,7 @@ public final class GraphPreprocessor {
         }
     }
 
-    private FirstPassStats runFirstPass() throws IOException {
+    private long runFirstPass() throws IOException {
         long edgeCount = 0;
 
         try (CsvEdgeReader reader = new CsvEdgeReader(config.input());
@@ -97,7 +98,7 @@ public final class GraphPreprocessor {
             throw new IOException("empty graph: input contains no edges");
         }
         logger.info("Pass 1 finished: edges=%d".formatted(edgeCount));
-        return new FirstPassStats(edgeCount);
+        return edgeCount;
     }
 
     private RewriteStats rewriteEdgesToDenseSourcePartitions() throws IOException {
@@ -168,30 +169,17 @@ public final class GraphPreprocessor {
         logger.info("Sorting dense edges and streaming unique edges to source storage");
         ensureSpaceForExternalSort(denseEdgesPath(), "dense edge sort");
         SourceStorageSink sink = new SourceStorageSink(vertexCount, partitionCount);
-        IOException failure = null;
-        try {
+        try (sink) {
             new DenseEdgeExternalSorter(recordSortChunkSize()).sortUniqueToSink(
                     denseEdgesPath(),
                     config.workDir().resolve("sort").resolve("dense-edges"),
                     "dense-edge-run",
                     sink
             );
-            sink.close();
-            Files.deleteIfExists(denseEdgesPath());
-            deleteRecursively(config.workDir().resolve("sort"));
-            return new SourceStorageStats(sink.edgeCount(), sink.sourcePartitions());
-        } catch (IOException ex) {
-            failure = ex;
-            throw ex;
-        } finally {
-            if (failure != null) {
-                try {
-                    sink.close();
-                } catch (IOException closeEx) {
-                    failure.addSuppressed(closeEx);
-                }
-            }
         }
+        Files.deleteIfExists(denseEdgesPath());
+        FileUtils.deleteRecursively(config.workDir().resolve("sort"));
+        return new SourceStorageStats(sink.edgeCount(), sink.sourcePartitions());
     }
 
     private long writeDenseEdges() throws IOException {
@@ -229,53 +217,6 @@ public final class GraphPreprocessor {
         }
     }
 
-    private void validateInput() {
-        if (!Files.exists(config.input())) {
-            throw new IllegalArgumentException("input file does not exist: " + config.input());
-        }
-        if (!Files.isRegularFile(config.input())) {
-            throw new IllegalArgumentException("input path is not a regular file: " + config.input());
-        }
-    }
-
-    private void validatePathLayout() throws IOException {
-        Path input = config.input().toRealPath();
-        Files.createDirectories(config.workDir());
-        Path work = config.workDir().toRealPath();
-        Path output = resolvePossiblyMissingPath(config.output());
-        if (input.equals(output)) {
-            throw new IllegalArgumentException("input and output must be different files");
-        }
-        if (input.startsWith(work)) {
-            throw new IllegalArgumentException("input must not be located inside workdir");
-        }
-        if (output.startsWith(work)) {
-            throw new IllegalArgumentException("output must not be located inside workdir");
-        }
-    }
-
-    private Path resolvePossiblyMissingPath(Path path) throws IOException {
-        if (Files.exists(path)) {
-            return path.toRealPath();
-        }
-        Path absolute = path.toAbsolutePath().normalize();
-        Path fileName = absolute.getFileName();
-        Path parent = absolute.getParent();
-        if (parent == null) {
-            return absolute;
-        }
-        Path existingParent = parent;
-        while (existingParent != null && !Files.exists(existingParent)) {
-            existingParent = existingParent.getParent();
-        }
-        if (existingParent == null) {
-            return absolute;
-        }
-        Path realParent = existingParent.toRealPath();
-        Path relative = existingParent.relativize(parent);
-        return realParent.resolve(relative).resolve(fileName).normalize();
-    }
-
     private void checkInitialFreeDiskSpace() throws IOException {
         Path probe = Files.exists(config.workDir())
                 ? config.workDir()
@@ -284,17 +225,17 @@ public final class GraphPreprocessor {
         long free = store.getUsableSpace();
         long inputSize = Files.size(config.input());
         long reserveBytes = 64L * 1024L * 1024L;
-        requireFreeSpace(free, saturatingAdd(saturatingMultiply(inputSize, 7L), reserveBytes), "initial preprocessing");
+        requireFreeSpace(free, SaturatedMath.add(SaturatedMath.multiply(inputSize, 7L), reserveBytes), "initial preprocessing");
     }
 
     private void checkPostFirstPassFreeDiskSpace(long inputEdges) throws IOException {
         FileStore store = Files.getFileStore(config.workDir());
         long free = store.getUsableSpace();
-        long endpointSortBytes = saturatingMultiply(inputEdges, 26L * 2L);
-        long assignmentSortBytes = saturatingMultiply(inputEdges, 26L * 2L);
-        long denseSortBytes = saturatingMultiply(inputEdges, 16L);
+        long endpointSortBytes = SaturatedMath.multiply(inputEdges, 26L * 2L);
+        long assignmentSortBytes = SaturatedMath.multiply(inputEdges, 26L * 2L);
+        long denseSortBytes = SaturatedMath.multiply(inputEdges, 16L);
         long safetyReserve = 64L * 1024L * 1024L;
-        long required = saturatingAdd(Math.max(endpointSortBytes, Math.max(assignmentSortBytes, denseSortBytes)), safetyReserve);
+        long required = SaturatedMath.add(Math.max(endpointSortBytes, Math.max(assignmentSortBytes, denseSortBytes)), safetyReserve);
         requireFreeSpace(free, required, "post first-pass preprocessing");
     }
 
@@ -303,44 +244,28 @@ public final class GraphPreprocessor {
         long free = store.getUsableSpace();
         long inputSize = Files.size(input);
         long reserveBytes = 64L * 1024L * 1024L;
-        long required = saturatingAdd(saturatingMultiply(inputSize, 2L), reserveBytes);
+        long required = SaturatedMath.add(SaturatedMath.multiply(inputSize, 2L), reserveBytes);
         requireFreeSpace(free, required, phase);
     }
 
     private void checkSourceAndRankFreeDiskSpace(long vertexCount, long storedEdges) throws IOException {
         FileStore store = Files.getFileStore(config.workDir());
         long free = store.getUsableSpace();
-        long sourcePhaseBytes = saturatingAdd(
-                saturatingMultiply(storedEdges, Integer.BYTES * 2L),
-                saturatingMultiply(vertexCount, Integer.BYTES)
+        long sourcePhaseBytes = SaturatedMath.add(
+                SaturatedMath.multiply(storedEdges, Integer.BYTES * 2L),
+                SaturatedMath.multiply(vertexCount, Integer.BYTES)
         );
-        long rankPhaseBytes = saturatingMultiply(vertexCount, Double.BYTES);
-        long sourceFileBlockBytes = saturatingMultiply(Math.min(storedEdges, partitionCount(vertexCount)), 4_096L);
+        long rankPhaseBytes = SaturatedMath.multiply(vertexCount, Double.BYTES);
+        long sourceFileBlockBytes = SaturatedMath.multiply(Math.min(storedEdges, partitionCount(vertexCount)), 4_096L);
         long reserveBytes = 64L * 1024L * 1024L;
-        long required = saturatingAdd(saturatingAdd(sourcePhaseBytes, rankPhaseBytes), sourceFileBlockBytes);
-        requireFreeSpace(free, saturatingAdd(required, reserveBytes), "source storage and rank initialization");
+        long required = SaturatedMath.add(SaturatedMath.add(sourcePhaseBytes, rankPhaseBytes), sourceFileBlockBytes);
+        requireFreeSpace(free, SaturatedMath.add(required, reserveBytes), "source storage and rank initialization");
     }
 
     private void requireFreeSpace(long free, long estimatedRequired, String phase) {
         if (free < estimatedRequired) {
             throw new IllegalStateException("not enough disk space for %s: free=%d estimatedRequired=%d"
                     .formatted(phase, free, estimatedRequired));
-        }
-    }
-
-    private long saturatingAdd(long left, long right) {
-        try {
-            return Math.addExact(left, right);
-        } catch (ArithmeticException ex) {
-            return Long.MAX_VALUE;
-        }
-    }
-
-    private long saturatingMultiply(long left, long right) {
-        try {
-            return Math.multiplyExact(left, right);
-        } catch (ArithmeticException ex) {
-            return Long.MAX_VALUE;
         }
     }
 
@@ -365,15 +290,15 @@ public final class GraphPreprocessor {
         Files.deleteIfExists(endpointAssignmentsPath());
         Files.deleteIfExists(endpointAssignmentsSortedPath());
         Files.deleteIfExists(denseEdgesPath());
-        deleteRecursively(config.workDir().resolve("sort"));
+        FileUtils.deleteRecursively(config.workDir().resolve("sort"));
     }
 
     private void cleanupFailedRunArtifactsSafely() {
         try {
             cleanupPreprocessingIntermediates();
-            deleteRecursively(edgesDir());
-            deleteRecursively(config.workDir().resolve("vertex"));
-            deleteRecursively(config.workDir().resolve("messages"));
+            FileUtils.deleteRecursively(edgesDir());
+            FileUtils.deleteRecursively(config.workDir().resolve("vertex"));
+            FileUtils.deleteRecursively(config.workDir().resolve("messages"));
             Files.deleteIfExists(verticesPath());
         } catch (IOException cleanupEx) {
             logger.info("WARNING failed to cleanup failed run artifacts: " + cleanupEx.getMessage());
@@ -389,7 +314,7 @@ public final class GraphPreprocessor {
     }
 
     private void validatePartitionMetadataBudget(int partitionCount) throws IOException {
-        long estimatedMetadataBytes = saturatingMultiply(partitionCount, 48L);
+        long estimatedMetadataBytes = SaturatedMath.multiply(partitionCount, 48L);
         long metadataBudget = Math.max(1L, MemoryUtils.maxHeapBytes() / 10L);
         if (estimatedMetadataBytes > metadataBudget) {
             throw new IOException("too many source partitions for heap; increase --chunk-size: partitions=%d estimatedMetadata=%s budget=%s"
@@ -447,13 +372,6 @@ public final class GraphPreprocessor {
         }
     }
 
-    private void deleteRecursively(Path path) throws IOException {
-        FileUtils.deleteRecursively(path);
-    }
-
-    private record FirstPassStats(long edgeCount) {
-    }
-
     private record RewriteStats(long vertexCount, long reconstructedInputEdges) {
     }
 
@@ -495,7 +413,7 @@ public final class GraphPreprocessor {
         private SourceStorageSink(long vertexCount, int partitionCount) throws IOException {
             this.vertexCount = vertexCount;
             this.partitionCount = partitionCount;
-            this.outDegree = new DiskIntArray(outDegreePath(), vertexCount, config.chunkSize());
+            this.outDegree = new DiskIntArray(outDegreePath(), vertexCount);
             this.outDegreeChunk = new int[config.chunkSize()];
             this.scratch = ByteBuffer.allocate(config.chunkSize() * Integer.BYTES);
             resetOutDegreeChunk();

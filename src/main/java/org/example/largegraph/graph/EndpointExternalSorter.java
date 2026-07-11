@@ -31,12 +31,12 @@ final class EndpointExternalSorter {
     }
 
     void sort(Path input, Path output, Path tempDir, String runPrefix) throws IOException {
-        deleteRecursively(tempDir);
+        FileUtils.deleteRecursively(tempDir);
         Files.createDirectories(tempDir);
         List<Path> runs = createSortedRuns(input, tempDir, runPrefix);
         runs = compactRuns(runs, tempDir, runPrefix);
         merge(runs, output);
-        deleteRecursively(tempDir);
+        FileUtils.deleteRecursively(tempDir);
     }
 
     private List<Path> createSortedRuns(Path input, Path tempDir, String runPrefix) throws IOException {
@@ -229,10 +229,6 @@ final class EndpointExternalSorter {
                 }
             }
         }
-    }
-
-    private void deleteRecursively(Path path) throws IOException {
-        FileUtils.deleteRecursively(path);
     }
 
     private static final class Chunk {

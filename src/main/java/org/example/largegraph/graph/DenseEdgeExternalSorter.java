@@ -27,16 +27,16 @@ final class DenseEdgeExternalSorter {
     }
 
     void sortUnique(Path input, Path output, Path tempDir, String runPrefix) throws IOException {
-        deleteRecursively(tempDir);
+        FileUtils.deleteRecursively(tempDir);
         Files.createDirectories(tempDir);
         List<Path> runs = createSortedUniqueRuns(input, tempDir, runPrefix);
         runs = compactRuns(runs, tempDir, runPrefix);
         mergeUnique(runs, output);
-        deleteRecursively(tempDir);
+        FileUtils.deleteRecursively(tempDir);
     }
 
     void sortUniqueToSink(Path input, Path tempDir, String runPrefix, EdgeSink sink) throws IOException {
-        deleteRecursively(tempDir);
+        FileUtils.deleteRecursively(tempDir);
         Files.createDirectories(tempDir);
         List<Path> runs = createSortedUniqueRuns(input, tempDir, runPrefix);
         runs = compactRuns(runs, tempDir, runPrefix);
@@ -44,7 +44,7 @@ final class DenseEdgeExternalSorter {
         for (Path run : runs) {
             Files.deleteIfExists(run);
         }
-        deleteRecursively(tempDir);
+        FileUtils.deleteRecursively(tempDir);
     }
 
     private List<Path> createSortedUniqueRuns(Path input, Path tempDir, String runPrefix) throws IOException {
@@ -105,47 +105,8 @@ final class DenseEdgeExternalSorter {
     }
 
     private void mergeUnique(List<Path> runs, Path output) throws IOException {
-        if (output.getParent() != null) {
-            Files.createDirectories(output.getParent());
-        }
-
-        PriorityQueue<Cursor> queue = new PriorityQueue<>(Comparator
-                .comparingInt(Cursor::from)
-                .thenComparingInt(Cursor::to)
-                .thenComparingInt(Cursor::runId));
-        List<Reader> readers = new ArrayList<>(runs.size());
-        IOException failure = null;
-
         try (Writer writer = new Writer(output)) {
-            for (int i = 0; i < runs.size(); i++) {
-                Reader reader = new Reader(runs.get(i));
-                readers.add(reader);
-                Cursor cursor = new Cursor(i);
-                if (reader.read(cursor)) {
-                    queue.add(cursor);
-                }
-            }
-
-            boolean haveLast = false;
-            int lastFrom = 0;
-            int lastTo = 0;
-            while (!queue.isEmpty()) {
-                Cursor cursor = queue.poll();
-                if (!haveLast || cursor.from() != lastFrom || cursor.to() != lastTo) {
-                    writer.write(cursor.from(), cursor.to());
-                    lastFrom = cursor.from();
-                    lastTo = cursor.to();
-                    haveLast = true;
-                }
-                if (readers.get(cursor.runId()).read(cursor)) {
-                    queue.add(cursor);
-                }
-            }
-        } catch (IOException ex) {
-            failure = ex;
-            throw ex;
-        } finally {
-            closeReaders(readers, failure);
+            mergeUniqueToSink(runs, writer::write);
         }
     }
 
@@ -206,10 +167,6 @@ final class DenseEdgeExternalSorter {
                 }
             }
         }
-    }
-
-    private void deleteRecursively(Path path) throws IOException {
-        FileUtils.deleteRecursively(path);
     }
 
     private static final class Chunk {

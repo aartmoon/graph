@@ -46,6 +46,13 @@ final class DiskArrayFile implements Closeable {
         }
     }
 
+    static void validateArrayRange(int arrayLength, int offset, int count) {
+        if (offset < 0 || count < 0 || offset > arrayLength - count) {
+            throw new IllegalArgumentException("invalid target range: offset=%d length=%d targetLength=%d"
+                    .formatted(offset, count, arrayLength));
+        }
+    }
+
     void ensureWritable() {
         if (!writable) throw new IllegalStateException("disk array is opened read-only: " + path);
     }

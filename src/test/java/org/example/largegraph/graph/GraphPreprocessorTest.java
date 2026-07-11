@@ -53,10 +53,10 @@ final class GraphPreprocessorTest {
         assertFalse(Files.exists(workDir.resolve("dense_edges.bin")));
         assertFalse(Files.exists(workDir.resolve("sort")));
 
-        try (DiskIntArray outDegree = new DiskIntArray(result.outDegreePath(), result.vertexCount(), config.chunkSize())) {
+        try (DiskIntArray outDegree = new DiskIntArray(result.outDegreePath(), result.vertexCount())) {
             assertArrayEquals(new int[]{2, 1, 1}, readAll(outDegree, result.vertexCount()));
         }
-        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), config.chunkSize())) {
+        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount())) {
             assertArrayEquals(new int[]{10, 20, 30}, readAll(vertices, result.vertexCount()));
         }
     }
@@ -77,7 +77,7 @@ final class GraphPreprocessorTest {
         GraphPreprocessor.PreprocessingResult result = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
 
         assertEquals(2, result.edgeCount());
-        try (DiskIntArray outDegree = new DiskIntArray(result.outDegreePath(), result.vertexCount(), config.chunkSize())) {
+        try (DiskIntArray outDegree = new DiskIntArray(result.outDegreePath(), result.vertexCount())) {
             assertArrayEquals(new int[]{2, 0, 0}, readAll(outDegree, result.vertexCount()));
         }
     }
@@ -93,7 +93,7 @@ final class GraphPreprocessorTest {
         GraphPreprocessor.PreprocessingResult result = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
 
         assertEquals(2, result.vertexCount());
-        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), config.chunkSize())) {
+        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount())) {
             assertArrayEquals(new int[]{100, 1_000_000}, readAll(vertices, result.vertexCount()));
         }
     }
@@ -114,7 +114,7 @@ final class GraphPreprocessorTest {
 
         assertEquals(3, result.vertexCount());
         assertEquals(2, result.edgeCount());
-        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), config.chunkSize())) {
+        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount())) {
             assertArrayEquals(new int[]{1, 2, 3}, readAll(vertices, result.vertexCount()));
         }
     }
@@ -142,7 +142,7 @@ final class GraphPreprocessorTest {
         GraphPreprocessor.PreprocessingResult result = new GraphPreprocessor(config, new ProgressLogger()).preprocess();
 
         assertEquals(2, result.vertexCount());
-        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount(), config.chunkSize())) {
+        try (DiskIntArray vertices = new DiskIntArray(result.verticesPath(), result.vertexCount())) {
             assertArrayEquals(new int[]{-1, 2}, readAll(vertices, result.vertexCount()));
         }
     }

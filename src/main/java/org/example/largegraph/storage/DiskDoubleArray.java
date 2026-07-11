@@ -35,7 +35,7 @@ public final class DiskDoubleArray implements Closeable {
             ByteBuffer scratch
     ) throws IOException {
         file.validateRange(startId, requestedLength);
-        validateTarget(target.length, targetOffset, requestedLength);
+        DiskArrayFile.validateArrayRange(target.length, targetOffset, requestedLength);
         ByteBuffer buffer = file.prepare(scratch, startId, requestedLength);
         file.readFully(buffer, startId);
         buffer.flip();
@@ -77,22 +77,11 @@ public final class DiskDoubleArray implements Closeable {
             int len = chunkLength(start);
             writeChunk(start, chunk, len);
         }
-        flush();
-    }
-
-    public void flush() throws IOException {
         file.force();
     }
 
     private int chunkLength(long startId) {
         return (int) Math.min(chunkSize, length - startId);
-    }
-
-    private void validateTarget(int targetLength, int targetOffset, int requestedLength) {
-        if (targetOffset < 0 || requestedLength < 0 || targetOffset + requestedLength > targetLength) {
-            throw new IllegalArgumentException("invalid target range: offset=%d length=%d targetLength=%d"
-                    .formatted(targetOffset, requestedLength, targetLength));
-        }
     }
 
     @Override

@@ -4,6 +4,7 @@ import org.example.largegraph.config.AppConfig;
 import org.example.largegraph.pagerank.PageRankEngine.PageRankRunResult;
 import org.example.largegraph.storage.DiskDoubleArray;
 import org.example.largegraph.storage.DiskIntArray;
+import org.example.largegraph.util.SaturatedMath;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -43,7 +44,7 @@ public final class PageRankResultWriter {
 
     private void writeAllStreaming(PageRankRunResult result, Path output) throws IOException {
         try (DiskDoubleArray ranks = new DiskDoubleArray(result.rankPath(), result.vertexCount(), config.chunkSize(), false);
-             DiskIntArray originalIds = new DiskIntArray(result.verticesPath(), result.vertexCount(), config.chunkSize(), false);
+             DiskIntArray originalIds = new DiskIntArray(result.verticesPath(), result.vertexCount(), false);
              BufferedWriter writer = Files.newBufferedWriter(output, StandardCharsets.UTF_8)) {
             writer.write("vertex,rank");
             writer.newLine();
@@ -75,7 +76,7 @@ public final class PageRankResultWriter {
     private void checkOutputDiskSpace(PageRankRunResult result) throws IOException {
         Path outputDir = config.output().getParent() == null ? Path.of(".") : config.output().getParent();
         FileStore store = Files.getFileStore(outputDir);
-        long estimatedBytes = saturatingAdd(saturatingMultiply(result.vertexCount(), 64L), 1024L * 1024L);
+        long estimatedBytes = SaturatedMath.add(SaturatedMath.multiply(result.vertexCount(), 64L), 1024L * 1024L);
         long free = store.getUsableSpace();
         if (free < estimatedBytes) {
             throw new IOException("not enough disk space for output CSV: free=%d estimatedRequired=%d"
@@ -88,22 +89,6 @@ public final class PageRankResultWriter {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (AtomicMoveNotSupportedException ex) {
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
-        }
-    }
-
-    private long saturatingMultiply(long left, long right) {
-        try {
-            return Math.multiplyExact(left, right);
-        } catch (ArithmeticException ex) {
-            return Long.MAX_VALUE;
-        }
-    }
-
-    private long saturatingAdd(long left, long right) {
-        try {
-            return Math.addExact(left, right);
-        } catch (ArithmeticException ex) {
-            return Long.MAX_VALUE;
         }
     }
 
